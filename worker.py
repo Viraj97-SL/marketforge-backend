@@ -60,34 +60,117 @@ def job_ingest() -> None:
         log.info("worker.ingest.collection_done", **summary)
 
         # ── NLP extraction ────────────────────────────────────────────────────
-        from marketforge.nlp.taxonomy import extract_skills_flat
+        from marketforge.nlp.taxonomy import extract_skills_flat, classify_role
         from marketforge.memory.postgres import get_sync_engine, JobStore
 
-        engine   = get_sync_engine()
-        jobs_t   = "jobs" if engine.dialect.name == "sqlite" else "market.jobs"
-        skills_t = "job_skills" if engine.dialect.name == "sqlite" else "market.job_skills"
+        # Role → implied skills used when descriptions are too short for keyword match.
+        # These are inserted at confidence=0.6 with method='role_inference' so
+        # downstream analytics can weight them differently from extracted skills.
+        _ROLE_IMPLIED: dict[str, list[tuple[str, str]]] = {
+            "ml_engineer":              [("Python", "language"), ("PyTorch", "dl_framework"),
+                                         ("scikit-learn", "ml_library"), ("SQL", "language"),
+                                         ("Docker", "infra"), ("NumPy", "data_analysis")],
+            "ai_engineer":              [("Python", "language"), ("PyTorch", "dl_framework"),
+                                         ("LangChain", "llm_framework"), ("Docker", "infra"),
+                                         ("REST API", "backend"), ("SQL", "language")],
+            "data_scientist":           [("Python", "language"), ("scikit-learn", "ml_library"),
+                                         ("SQL", "language"), ("Pandas", "data_analysis"),
+                                         ("NumPy", "data_analysis"), ("Matplotlib", "visualisation")],
+            "mlops_engineer":           [("Python", "language"), ("Kubernetes", "infra"),
+                                         ("Docker", "infra"), ("MLflow", "mlops"),
+                                         ("CI/CD", "devops"), ("Terraform", "infra")],
+            "nlp_engineer":             [("Python", "language"), ("PyTorch", "dl_framework"),
+                                         ("Hugging Face", "llm_framework"), ("BERT", "nlp"),
+                                         ("spaCy", "nlp"), ("SQL", "language")],
+            "computer_vision_engineer": [("Python", "language"), ("PyTorch", "dl_framework"),
+                                         ("OpenCV", "computer_vision"), ("NumPy", "data_analysis"),
+                                         ("Docker", "infra")],
+            "research_scientist":       [("Python", "language"), ("PyTorch", "dl_framework"),
+                                         ("JAX", "dl_framework"), ("NumPy", "data_analysis"),
+                                         ("SQL", "language")],
+            "applied_scientist":        [("Python", "language"), ("PyTorch", "dl_framework"),
+                                         ("scikit-learn", "ml_library"), ("SQL", "language"),
+                                         ("Pandas", "data_analysis")],
+            "data_engineer":            [("Python", "language"), ("SQL", "language"),
+                                         ("Apache Spark", "data_engineering"), ("dbt", "data_engineering"),
+                                         ("Docker", "infra"), ("Airflow", "mlops")],
+            "ai_safety_researcher":     [("Python", "language"), ("PyTorch", "dl_framework"),
+                                         ("RLHF", "llm_technique"), ("NumPy", "data_analysis")],
+            "ai_product_manager":       [("Python", "language"), ("SQL", "language")],
+            "other":                    [("Python", "language"), ("SQL", "language")],
+        }
 
+        engine   = get_sync_engine()
+        is_sqlite = engine.dialect.name == "sqlite"
+        jobs_t   = "jobs"      if is_sqlite else "market.jobs"
+        skills_t = "job_skills" if is_sqlite else "market.job_skills"
+
+        # Fetch jobs with no skills yet AND also jobs with NULL role_category
+        # (role classification runs for all un-classified jobs in the same pass)
         with engine.connect() as conn:
             rows = conn.execute(text(f"""
-                SELECT j.job_id, j.title, j.description FROM {jobs_t} j
+                SELECT j.job_id, j.title, j.description, j.role_category
+                FROM {jobs_t} j
                 WHERE NOT EXISTS (
                     SELECT 1 FROM {skills_t} s WHERE s.job_id = j.job_id
                 )
             """)).fetchall()
 
         log.info("worker.ingest.nlp_start", jobs=len(rows))
-        nlp_stats = {"gate1": 0, "gate2": 0, "gate3": 0}
+        nlp_stats = {"gate1": 0, "gate2": 0, "gate3": 0, "role_inference": 0}
         job_store = JobStore()
 
         for row in rows:
-            job_id, title, description = row
-            text_blob = f"{title}\n{description or ''}"
-            # extract_skills_flat returns list[tuple[skill, category, gate, confidence]]
-            skills = extract_skills_flat(text_blob)
-            if skills:
-                job_store.upsert_skills(job_id, skills)
-                for _, _, gate, _ in skills:
-                    nlp_stats[gate] = nlp_stats.get(gate, 0) + 1
+            try:
+                job_id, title, description, stored_role = row
+                desc = description or ""
+                text_blob = f"{title}\n{desc}"
+
+                # ── Gate 1-3: taxonomy + spaCy + LLM ─────────────────────────
+                skills = extract_skills_flat(text_blob)
+
+                # ── Role classification ───────────────────────────────────────
+                # classify_role uses title patterns; update DB if not yet set
+                role_cat, exp_level = classify_role(title)
+                if not stored_role:
+                    with engine.connect() as conn:
+                        if is_sqlite:
+                            conn.execute(text(f"""
+                                UPDATE {jobs_t}
+                                SET role_category = :rc, experience_level = :el
+                                WHERE job_id = :jid
+                            """), {"rc": role_cat, "el": exp_level, "jid": job_id})
+                        else:
+                            conn.execute(text(f"""
+                                UPDATE {jobs_t}
+                                SET role_category = :rc, experience_level = :el
+                                WHERE job_id = :jid
+                                  AND (role_category IS NULL OR experience_level IS NULL)
+                            """), {"rc": role_cat, "el": exp_level, "jid": job_id})
+                        conn.commit()
+
+                # ── Fallback: role-implied skills when description is too short ─
+                # Short snippets (<150 chars) won't have tech keywords.
+                # Infer likely skills from the classified role at lower confidence.
+                desc_too_short = len(desc.strip()) < 150
+                if desc_too_short or not skills:
+                    implied_pairs = _ROLE_IMPLIED.get(role_cat, _ROLE_IMPLIED["other"])
+                    # Keep only skills NOT already found by taxonomy gates
+                    found_canonicals = {s[0] for s in skills}
+                    implied_skills = [
+                        (skill, cat, "role_inference", 0.6)
+                        for skill, cat in implied_pairs
+                        if skill not in found_canonicals
+                    ]
+                    skills = skills + implied_skills
+
+                if skills:
+                    job_store.upsert_skills(job_id, skills)
+                    for _, _, gate, _ in skills:
+                        nlp_stats[gate] = nlp_stats.get(gate, 0) + 1
+
+            except Exception as exc:
+                log.warning("worker.ingest.nlp_job_error", job_id=row[0], error=str(exc))
 
         log.info("worker.ingest.nlp_done", **nlp_stats)
 

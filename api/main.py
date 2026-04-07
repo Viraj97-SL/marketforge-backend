@@ -543,6 +543,108 @@ async def get_trending_skills(
     return result
 
 
+# ── Jobs listing endpoint ─────────────────────────────────────────────────────
+
+@app.get("/api/v1/jobs", summary="Browse indexed UK AI/ML job listings")
+async def get_jobs(
+    role_category:    str | None = Query(default=None, description="Filter by role category"),
+    work_model:       str | None = Query(default=None, description="remote / hybrid / onsite"),
+    experience_level: str | None = Query(default=None, description="junior / mid / senior / lead"),
+    source:           str | None = Query(default=None, description="adzuna / reed / etc."),
+    visa_only:        bool       = Query(default=False, description="Only jobs with visa sponsorship"),
+    page:             int        = Query(default=1, ge=1, description="Page number"),
+    page_size:        int        = Query(default=20, ge=1, le=100, description="Jobs per page"),
+) -> dict:
+    cache_key = f"jobs:{role_category}:{work_model}:{experience_level}:{source}:{visa_only}:{page}:{page_size}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    jobs_t    = "jobs"       if is_sqlite else "market.jobs"
+    skills_t  = "job_skills" if is_sqlite else "market.job_skills"
+
+    # Build WHERE clauses
+    conditions = []
+    params: dict = {}
+    if role_category and role_category != "all":
+        conditions.append("j.role_category = :role")
+        params["role"] = role_category
+    if work_model:
+        conditions.append("j.work_model = :wm")
+        params["wm"] = work_model
+    if experience_level:
+        conditions.append("j.experience_level = :el")
+        params["el"] = experience_level
+    if source:
+        conditions.append("j.source = :src")
+        params["src"] = source
+    if visa_only:
+        conditions.append("j.offers_sponsorship = TRUE")
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    offset = (page - 1) * page_size
+    params["limit"] = page_size
+    params["offset"] = offset
+
+    # Skills subquery — dialect-aware
+    if is_sqlite:
+        skills_sub = (
+            f"(SELECT GROUP_CONCAT(skill, ', ') FROM "
+            f"(SELECT skill FROM {skills_t} WHERE job_id = j.job_id ORDER BY confidence DESC LIMIT 8))"
+        )
+    else:
+        skills_sub = (
+            f"(SELECT STRING_AGG(skill, ', ' ORDER BY confidence DESC) FROM "
+            f"(SELECT skill, confidence FROM {skills_t} WHERE job_id = j.job_id "
+            f"ORDER BY confidence DESC LIMIT 8) _s)"
+        )
+
+    with engine.connect() as conn:
+        total = conn.execute(text(
+            f"SELECT COUNT(*) FROM {jobs_t} j {where}"
+        ), params).scalar() or 0
+
+        rows = conn.execute(text(f"""
+            SELECT j.job_id, j.title, j.company, j.location,
+                   j.salary_min, j.salary_max, j.work_model,
+                   j.experience_level, j.role_category, j.source,
+                   j.offers_sponsorship, j.posted_date, j.scraped_at, j.url,
+                   j.is_startup, j.company_stage,
+                   COALESCE({skills_sub}, '') AS skills
+            FROM {jobs_t} j
+            {where}
+            ORDER BY j.scraped_at DESC
+            LIMIT :limit OFFSET :offset
+        """), params).mappings().fetchall()
+
+    jobs = []
+    for r in rows:
+        d = dict(r)
+        # Serialise dates as strings
+        for f in ("posted_date", "scraped_at"):
+            if d.get(f) is not None and not isinstance(d[f], str):
+                d[f] = str(d[f])
+        # Split skills CSV into list
+        d["skills"] = [s.strip() for s in (d.get("skills") or "").split(",") if s.strip()]
+        jobs.append(d)
+
+    result = {
+        "jobs":      jobs,
+        "total":     int(total),
+        "page":      page,
+        "page_size": page_size,
+        "pages":     max(1, -(-int(total) // page_size)),  # ceiling div
+    }
+    # Short TTL so freshly-scraped jobs appear quickly
+    cache.set(cache_key, result)
+    return result
+
+
 # ── Health endpoint ───────────────────────────────────────────────────────────
 
 @app.get("/api/v1/health", response_model=HealthResponse, summary="Platform health")
