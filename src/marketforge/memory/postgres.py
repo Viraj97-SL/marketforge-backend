@@ -395,11 +395,21 @@ class DedupStore:
         self._table = "seen_jobs" if self._is_sqlite else "market.seen_jobs"
 
     def is_seen(self, dedup_hash: str) -> bool:
+        from marketforge.config.settings import settings
+        ttl = settings.pipeline.dedup_hash_ttl_days
         with self._engine.connect() as conn:
-            row = conn.execute(
-                text(f"SELECT 1 FROM {self._table} WHERE dedup_hash = :h"),
-                {"h": dedup_hash},
-            ).fetchone()
+            if self._is_sqlite:
+                row = conn.execute(
+                    text(f"SELECT 1 FROM {self._table} WHERE dedup_hash = :h"
+                         f" AND datetime(last_seen) > datetime('now', :ttl)"),
+                    {"h": dedup_hash, "ttl": f"-{ttl} days"},
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    text(f"SELECT 1 FROM {self._table} WHERE dedup_hash = :h"
+                         f" AND last_seen > NOW() - INTERVAL '{ttl} days'"),
+                    {"h": dedup_hash},
+                ).fetchone()
         return row is not None
 
     def mark_seen(self, dedup_hash: str, job_id: str, title: str, company: str, source: str) -> None:
@@ -424,7 +434,7 @@ class DedupStore:
             conn.commit()
 
     def filter_new(self, jobs: list) -> list:
-        """Return only unseen jobs, marking all as seen atomically."""
+        """Return only unseen (or TTL-expired) jobs, marking all as seen atomically."""
         new = []
         for job in jobs:
             if not self.is_seen(job.dedup_hash):
@@ -532,13 +542,13 @@ class JobStore:
                      salary_min, salary_max, work_model, experience_level,
                      role_category, industry, company_stage, is_startup,
                      offers_sponsorship, citizens_only, degree_required,
-                     url, source, posted_date, scraped_at)
+                     equity_offered, url, source, posted_date, scraped_at)
                 VALUES
                     (:job_id, :dedup_hash, :run_id, :title, :description, :company, :location,
                      :salary_min, :salary_max, :work_model, :experience_level,
                      :role_category, :industry, :company_stage, :is_startup,
                      :offers_sponsorship, :citizens_only, :degree_required,
-                     :url, :source, :posted_date, :scraped_at)
+                     :equity_offered, :url, :source, :posted_date, :scraped_at)
                 ON CONFLICT(job_id) DO NOTHING
             """), {
                 "job_id": j.job_id, "dedup_hash": j.dedup_hash, "run_id": run_id,
@@ -550,6 +560,7 @@ class JobStore:
                 "is_startup": int(j.is_startup) if self._is_sqlite else j.is_startup,
                 "offers_sponsorship": j.offers_sponsorship,
                 "citizens_only": j.citizens_only, "degree_required": j.degree_required,
+                "equity_offered": int(j.equity_offered) if (self._is_sqlite and j.equity_offered is not None) else j.equity_offered,
                 "url": j.url or None,
                 "source": j.source,
                 "posted_date": j.posted_date.isoformat() if j.posted_date else None,

@@ -311,18 +311,21 @@ class PIIScrubbingAgent(DeepAgent):
                 if mode == "scrub":
                     scrubbed = scrubbed.replace(match, f"[REDACTED:{pii_type.upper()}]")
 
-        # Pass 2: spaCy PERSON entities
-        try:
-            import spacy
-            nlp = spacy.load("en_core_web_sm", disable=["parser", "lemmatizer", "tagger"])
-            doc = nlp(text[:3000])
-            for ent in doc.ents:
-                if ent.label_ == "PERSON":
-                    pii_found.append({"type": "person_name", "fragment": ent.text[:10] + "…"})
-                    if mode == "scrub":
+        # Pass 2: spaCy PERSON entities — only in scrub mode (job data).
+        # Skipped for reject mode (user inputs) because spaCy frequently
+        # misclassifies technology names (PyTorch, FastAPI, etc.) as PERSON
+        # entities, causing false-positive rejections of legitimate skill lists.
+        if mode == "scrub":
+            try:
+                import spacy
+                nlp = spacy.load("en_core_web_sm", disable=["parser", "lemmatizer", "tagger"])
+                doc = nlp(text[:3000])
+                for ent in doc.ents:
+                    if ent.label_ == "PERSON":
+                        pii_found.append({"type": "person_name", "fragment": ent.text[:10] + "…"})
                         scrubbed = scrubbed.replace(ent.text, "[REDACTED:PERSON]")
-        except Exception:
-            pass   # spaCy not available — regex-only is acceptable
+            except Exception:
+                pass   # spaCy not available — regex-only is acceptable
 
         clean = len(pii_found) == 0
 
