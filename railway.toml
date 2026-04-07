@@ -1,0 +1,44 @@
+# MarketForge AI Backend — Railway Multi-Service Config
+# Deploy this repo to Railway. Create TWO services from the same repo:
+#   1. "api"    → runs the FastAPI server
+#   2. "worker" → runs the APScheduler pipeline worker
+# Each service overrides startCommand in its Railway dashboard settings.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+# ── Service: API ──────────────────────────────────────────────────────────────
+# startCommand (set in Railway dashboard for "api" service):
+#   uvicorn api.main:app --host 0.0.0.0 --port $PORT
+
+[deploy]
+startCommand = "uvicorn api.main:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/api/v1/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
+
+# ── Service: Worker ───────────────────────────────────────────────────────────
+# For the worker service, override startCommand in Railway dashboard to:
+#   python worker.py
+
+# ── Environment Variables (set in Railway dashboard — never commit) ──────────
+# DATABASE_URL          — auto-injected by Railway PostgreSQL addon
+# REDIS_URL             — auto-injected by Railway Redis addon
+# GEMINI_API_KEY        — Google AI Studio
+# LANGCHAIN_API_KEY     — LangSmith
+# LANGCHAIN_TRACING_V2  — true
+# LANGCHAIN_PROJECT     — marketforge-backend
+# ADZUNA_APP_ID         — Adzuna developer portal
+# ADZUNA_APP_KEY        — Adzuna developer portal
+# REED_API_KEY          — Reed developer portal
+# TAVILY_API_KEY        — Tavily
+# SMTP_HOST             — smtp.gmail.com
+# SMTP_PORT             — 587
+# SMTP_USER             — Gmail address
+# SMTP_PASSWORD         — Gmail app password
+# REPORT_RECIPIENT_EMAIL— target email for weekly report
+# ENVIRONMENT           — production
+# LOG_LEVEL             — INFO
+# LOG_FORMAT            — json
