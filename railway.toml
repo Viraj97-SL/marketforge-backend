@@ -13,7 +13,6 @@ dockerfilePath = "Dockerfile"
 #   uvicorn api.main:app --host 0.0.0.0 --port $PORT
 
 [deploy]
-startCommand = "/bin/sh -c 'uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}'"
 healthcheckPath = "/api/v1/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
