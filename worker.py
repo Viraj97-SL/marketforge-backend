@@ -94,7 +94,10 @@ def job_ingest() -> None:
         # ── Market analysis ───────────────────────────────────────────────────
         from marketforge.agents.market_analysis.lead_agent import MarketAnalystLeadAgent
         analyst = MarketAnalystLeadAgent()
-        asyncio.run(analyst.execute({}, None))
+        async def _run_analysis():
+            plan = await analyst.plan({}, {})
+            return await analyst.execute(plan, {})
+        asyncio.run(_run_analysis())
         log.info("worker.ingest.analysis_done")
 
         # ── Cache invalidation ────────────────────────────────────────────────
@@ -125,7 +128,10 @@ def job_weekly_analysis() -> None:
     try:
         from marketforge.agents.market_analysis.lead_agent import MarketAnalystLeadAgent
         analyst = MarketAnalystLeadAgent()
-        asyncio.run(analyst.execute({}, None))
+        async def _run_analysis():
+            plan = await analyst.plan({}, {})
+            return await analyst.execute(plan, {})
+        asyncio.run(_run_analysis())
 
         from marketforge.memory.redis_cache import DashboardCache
         try:
@@ -149,7 +155,10 @@ def job_model_retrain() -> None:
     try:
         from marketforge.agents.ml_engineering.lead_agent import MLEngineerLeadAgent
         lead = MLEngineerLeadAgent()
-        asyncio.run(lead.execute({}, None))
+        async def _run_retrain():
+            plan = await lead.plan({}, {})
+            return await lead.execute(plan, {})
+        asyncio.run(_run_retrain())
         log.info("worker.retrain.done", run_id=run_id)
     except Exception as exc:
         log.error("worker.retrain.failed", run_id=run_id, error=str(exc))
