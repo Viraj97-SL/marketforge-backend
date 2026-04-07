@@ -82,14 +82,12 @@ def job_ingest() -> None:
         for row in rows:
             job_id, title, description = row
             text_blob = f"{title}\n{description or ''}"
-            result    = extract_skills_flat(text_blob)
-            if result.get("skills"):
-                skills = [(s, result.get("categories", {}).get(s, "general"),
-                           result.get("method", "gate1"), 1.0)
-                          for s in result["skills"]]
+            # extract_skills_flat returns list[tuple[skill, category, gate, confidence]]
+            skills = extract_skills_flat(text_blob)
+            if skills:
                 job_store.upsert_skills(job_id, skills)
-                gate = result.get("method", "gate1")
-                nlp_stats[gate] = nlp_stats.get(gate, 0) + len(skills)
+                for _, _, gate, _ in skills:
+                    nlp_stats[gate] = nlp_stats.get(gate, 0) + 1
 
         log.info("worker.ingest.nlp_done", **nlp_stats)
 
