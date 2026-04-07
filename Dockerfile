@@ -23,5 +23,5 @@ RUN pip install --no-cache-dir -e . || true
 # Bootstrap DB schema (idempotent)
 RUN python scripts/bootstrap.py || echo "[WARN] Bootstrap deferred to first start"
 
-# Default: API server. Override with CMD in Railway service config for worker.
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Shell form so Railway's $PORT env var is expanded at runtime
+CMD ["/bin/sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
