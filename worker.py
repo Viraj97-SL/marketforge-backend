@@ -216,4 +216,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import os
+    run_now_env = os.getenv("RUN_NOW_ON_START")
+    if run_now_env and run_now_env in JOBS:
+        log.info("worker.env_trigger", job=run_now_env)
+        JOBS[run_now_env]()
+        # Clear the var hint so next restart goes to scheduler mode
     main()
