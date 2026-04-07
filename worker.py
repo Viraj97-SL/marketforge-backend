@@ -107,10 +107,10 @@ def job_ingest() -> None:
         except Exception as cache_exc:
             log.warning("worker.ingest.cache_skip", error=str(cache_exc))
 
-        run_store.complete(run_id, status="success",
-                           jobs_scraped=summary.get("jobs_new", 0),
-                           jobs_new=summary.get("jobs_new", 0),
-                           llm_cost_usd=cost_tracker.total_cost)
+        run_store.finish(run_id, status="success",
+                         jobs_scraped=summary.get("jobs_new", 0),
+                         jobs_new=summary.get("jobs_new", 0),
+                         llm_cost_usd=cost_tracker.total_usd)
         log.info("worker.ingest.done", run_id=run_id)
 
     except Exception as exc:
