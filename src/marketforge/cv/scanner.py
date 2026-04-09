@@ -30,13 +30,17 @@ _DOCX_MAGIC = b"PK\x03\x04"   # ZIP container — shared by DOCX/XLSX/PPTX
 
 # ── Dangerous PDF byte-patterns ───────────────────────────────────────────────
 # These indicate executable content or launch actions inside a PDF.
+# Notes on omissions:
+#   /EmbeddedFile — omitted: common false positive; PDF generators legitimately
+#                   use EmbeddedFile streams for font subsets and metadata.
+#   /AA            — omitted: additional-actions dict appears in virtually every
+#                   PDF produced by Word/LibreOffice/Adobe for page navigation.
+#   /OpenAction    — omitted: used by most PDF viewers for initial-view settings
+#                   (zoom level, page layout) — not inherently dangerous.
 _PDF_DANGER_PATTERNS: list[bytes] = [
     b"/JS ",
     b"/JavaScript",
     b"/Launch",
-    b"/EmbeddedFile",
-    b"/OpenAction",
-    b"/AA ",     # additional-actions dictionary
 ]
 
 # ── DOCX VBA/macro indicators (filenames inside the ZIP) ─────────────────────
