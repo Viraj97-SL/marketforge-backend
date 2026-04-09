@@ -165,7 +165,7 @@ async def analyse_career(profile: UserProfile, request: Request) -> CareerIntell
     skills_text = sec_result.sanitised_text
 
     # ── Market match via SBERT + ChromaDB ────────────────────────────────────
-    match_pct, match_dist = _compute_market_match(profile.skills)
+    match_pct, match_dist = _compute_market_match(profile.skills, profile.target_role)
 
     # ── Skill gap analysis ────────────────────────────────────────────────────
     skill_gaps = _compute_skill_gaps(profile.skills, profile.target_role)
@@ -195,41 +195,64 @@ async def analyse_career(profile: UserProfile, request: Request) -> CareerIntell
     )
 
 
-def _compute_market_match(skills: list[str]) -> tuple[float, dict[str, float]]:
-    """SBERT embed the skill list and query market data for similarity."""
+def _compute_market_match(
+    skills:      list[str],
+    target_role: str = "",
+) -> tuple[float, dict[str, float]]:
+    """
+    SBERT embed the skill list and compare against job descriptions for the
+    target role.  When target_role is provided, only jobs with a matching
+    role_category are sampled so the score reflects fit for that role.
+    """
     try:
         import numpy as np
         from marketforge.memory.postgres import get_sync_engine
         from sqlalchemy import text
-        engine = get_sync_engine()
-        is_sqlite = engine.dialect.name == "sqlite"
-        table = "jobs" if is_sqlite else "market.jobs"
+        from marketforge.cv.ats_scorer import _normalise_role
 
-        # Sample recent job titles for comparison
+        engine    = get_sync_engine()
+        is_sqlite = engine.dialect.name == "sqlite"
+        table     = "jobs" if is_sqlite else "market.jobs"
+        role_cat  = _normalise_role(target_role) if target_role else ""
+
         with engine.connect() as conn:
-            rows = conn.execute(text(f"""
-                SELECT title, role_category FROM {table}
-                ORDER BY scraped_at DESC LIMIT 200
-            """)).fetchall()
+            if role_cat and role_cat != "other":
+                # Role-specific sample — try up to 300 to get enough rows
+                rows = conn.execute(text(f"""
+                    SELECT title, role_category FROM {table}
+                    WHERE role_category = :role
+                    ORDER BY scraped_at DESC LIMIT 300
+                """), {"role": role_cat}).fetchall()
+                # Fall back to all roles if insufficient data for this role
+                if len(rows) < 20:
+                    rows = conn.execute(text(f"""
+                        SELECT title, role_category FROM {table}
+                        ORDER BY scraped_at DESC LIMIT 200
+                    """)).fetchall()
+            else:
+                rows = conn.execute(text(f"""
+                    SELECT title, role_category FROM {table}
+                    ORDER BY scraped_at DESC LIMIT 200
+                """)).fetchall()
 
         if not rows:
             return 50.0, {"strong": 0.3, "moderate": 0.4, "weak": 0.3}
 
-        model      = _get_sbert()
-        profile_emb= model.encode(" ".join(skills), normalize_embeddings=True)
-        job_texts  = [f"{r[0]} {r[1] or ''}" for r in rows]
-        job_embs   = model.encode(job_texts, normalize_embeddings=True, batch_size=64)
+        model       = _get_sbert()
+        profile_emb = model.encode(" ".join(skills), normalize_embeddings=True)
+        job_texts   = [f"{r[0]} {r[1] or ''}" for r in rows]
+        job_embs    = model.encode(job_texts, normalize_embeddings=True, batch_size=64)
 
         similarities = np.dot(job_embs, profile_emb)
-        strong   = float(np.mean(similarities > 0.75))
-        moderate = float(np.mean((similarities > 0.55) & (similarities <= 0.75)))
-        weak     = float(np.mean(similarities <= 0.55))
-        match_pct= float(np.mean(similarities) * 100)
+        strong    = float(np.mean(similarities > 0.75))
+        moderate  = float(np.mean((similarities > 0.55) & (similarities <= 0.75)))
+        weak      = float(np.mean(similarities <= 0.55))
+        match_pct = float(np.mean(similarities) * 100)
 
         return min(max(match_pct, 0), 100), {
-            "strong": round(strong, 3),
+            "strong":   round(strong,   3),
             "moderate": round(moderate, 3),
-            "weak": round(weak, 3),
+            "weak":     round(weak,     3),
         }
     except Exception as exc:
         logger.warning("market_match.error", error=str(exc))
@@ -237,32 +260,59 @@ def _compute_market_match(skills: list[str]) -> tuple[float, dict[str, float]]:
 
 
 def _compute_skill_gaps(user_skills: list[str], target_role: str) -> list[dict[str, Any]]:
-    """Compare user skills against top-demanded skills for the target role."""
+    """
+    Compare user skills against top-demanded skills for the target role.
+    Queries live job_skills filtered by role_category; falls back to the
+    global weekly snapshot if no role-specific data exists.
+    """
     try:
         from marketforge.memory.postgres import get_sync_engine
         from sqlalchemy import text
         import json
+        from marketforge.cv.ats_scorer import _normalise_role
 
         engine    = get_sync_engine()
         is_sqlite = engine.dialect.name == "sqlite"
+        jobs_t    = "jobs"       if is_sqlite else "market.jobs"
+        skills_t  = "job_skills" if is_sqlite else "market.job_skills"
         snap_t    = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
+        role_cat  = _normalise_role(target_role)
+        user_lower = {s.lower() for s in user_skills}
+
+        top_skills: dict[str, int] = {}
 
         with engine.connect() as conn:
-            row = conn.execute(text(f"""
-                SELECT top_skills FROM {snap_t}
-                ORDER BY week_start DESC LIMIT 1
-            """)).fetchone()
+            # Live per-role query
+            rows = conn.execute(text(f"""
+                SELECT js.skill, COUNT(*) AS cnt
+                FROM {skills_t} js
+                JOIN {jobs_t} j ON j.job_id = js.job_id
+                WHERE j.role_category = :role
+                GROUP BY js.skill
+                ORDER BY cnt DESC
+                LIMIT 50
+            """), {"role": role_cat}).fetchall()
 
-        if not row or not row[0]:
-            return []
-
-        top_skills = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-        user_lower = {s.lower() for s in user_skills}
+            if rows:
+                top_skills = {r[0]: r[1] for r in rows}
+            else:
+                # Snapshot fallback
+                row = conn.execute(text(f"""
+                    SELECT top_skills FROM {snap_t}
+                    WHERE role_category = 'all'
+                    ORDER BY week_start DESC LIMIT 1
+                """)).fetchone()
+                if row and row[0]:
+                    top_skills = json.loads(row[0]) if isinstance(row[0], str) else row[0]
 
         gaps = []
         for skill, count in sorted(top_skills.items(), key=lambda x: -x[1]):
             if skill.lower() not in user_lower:
-                gaps.append({"skill": skill, "market_demand": count, "priority": "high" if count > 50 else "medium"})
+                gaps.append({
+                    "skill":         skill,
+                    "market_demand": count,
+                    "priority":      "high" if count > 50 else "medium",
+                })
             if len(gaps) >= 10:
                 break
         return gaps
@@ -785,7 +835,7 @@ async def analyse_cv(
     ats = score_cv(cv, target_role)
 
     # ── Market match (SBERT) ───────────────────────────────────────────────────
-    match_pct, _ = _compute_market_match(ats.skills_found or [target_role])
+    match_pct, _ = _compute_market_match(ats.skills_found or [target_role], target_role)
 
     # ── Phase 2: ML gap analysis (demand × salary × recency priority scoring) ──
     from marketforge.cv.gap_analyser import analyse_gaps

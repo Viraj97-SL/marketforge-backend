@@ -26,6 +26,37 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+# ── Role normalisation (mirrors ats_scorer) ───────────────────────────────────
+_ROLE_MAP: dict[str, str] = {
+    "ml engineer":                "ml_engineer",
+    "data scientist":             "data_scientist",
+    "ai engineer":                "ai_engineer",
+    "mlops engineer":             "mlops_engineer",
+    "nlp engineer":               "nlp_engineer",
+    "computer vision engineer":   "computer_vision_engineer",
+    "research scientist":         "research_scientist",
+    "applied scientist":          "applied_scientist",
+    "data engineer":              "data_engineer",
+    "ai safety researcher":       "ai_safety_researcher",
+    "ai product manager":         "ai_product_manager",
+    "ml_engineer":                "ml_engineer",
+    "data_scientist":             "data_scientist",
+    "ai_engineer":                "ai_engineer",
+    "mlops_engineer":             "mlops_engineer",
+    "nlp_engineer":               "nlp_engineer",
+    "computer_vision_engineer":   "computer_vision_engineer",
+    "research_scientist":         "research_scientist",
+    "applied_scientist":          "applied_scientist",
+    "data_engineer":              "data_engineer",
+    "ai_safety_researcher":       "ai_safety_researcher",
+    "ai_product_manager":         "ai_product_manager",
+}
+
+
+def _normalise_role(target_role: str) -> str:
+    return _ROLE_MAP.get(target_role.lower().strip(), "other")
+
+
 # ── Skills addressable quickly (courses / certs exist) ────────────────────────
 _SHORT_TERM_SKILLS: frozenset[str] = frozenset({
     "Docker", "Kubernetes", "MLflow", "Airflow", "FastAPI", "Flask",
@@ -88,7 +119,7 @@ def analyse_gaps(
     Returns:
         GapAnalysis with gaps bucketed into short/mid/long-term horizons.
     """
-    market_data = _fetch_market_data()
+    market_data = _fetch_market_data(target_role)
     if not market_data:
         return GapAnalysis()
 
@@ -149,8 +180,15 @@ def analyse_gaps(
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _fetch_market_data() -> dict | None:
-    """Pull latest weekly snapshot from DB."""
+def _fetch_market_data(target_role: str = "") -> dict | None:
+    """
+    Pull role-specific skill demand from DB.
+
+    Query strategy (most specific → least specific):
+      1. Live job_skills JOIN jobs WHERE role_category = <normalised_role>
+      2. weekly_snapshots WHERE role_category = <normalised_role>
+      3. weekly_snapshots WHERE role_category = 'all'
+    """
     try:
         import json
         from marketforge.memory.postgres import get_sync_engine
@@ -158,20 +196,58 @@ def _fetch_market_data() -> dict | None:
 
         engine    = get_sync_engine()
         is_sqlite = engine.dialect.name == "sqlite"
+        role_cat  = _normalise_role(target_role) if target_role else "other"
+        jobs_t    = "jobs"       if is_sqlite else "market.jobs"
+        skills_t  = "job_skills" if is_sqlite else "market.job_skills"
         snap_t    = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
 
+        top_skills: dict[str, int] = {}
+        rising_skills: list[str]   = []
+
         with engine.connect() as conn:
-            row = conn.execute(text(f"""
-                SELECT top_skills, rising_skills, declining_skills
-                FROM {snap_t}
-                ORDER BY week_start DESC LIMIT 1
-            """)).fetchone()
+            # ── Strategy 1: live per-role aggregation ─────────────────────────
+            rows = conn.execute(text(f"""
+                SELECT js.skill, COUNT(*) AS cnt
+                FROM {skills_t} js
+                JOIN {jobs_t} j ON j.job_id = js.job_id
+                WHERE j.role_category = :role
+                GROUP BY js.skill
+                ORDER BY cnt DESC
+                LIMIT 60
+            """), {"role": role_cat}).fetchall()
 
-        if not row:
+            if rows:
+                top_skills = {r[0]: r[1] for r in rows}
+                logger.debug("gap_analyser.role_live", role=role_cat, skills=len(top_skills))
+            else:
+                # ── Strategy 2: role-specific snapshot ────────────────────────
+                row = conn.execute(text(f"""
+                    SELECT top_skills, rising_skills
+                    FROM {snap_t}
+                    WHERE role_category = :role
+                    ORDER BY week_start DESC LIMIT 1
+                """), {"role": role_cat}).fetchone()
+
+                if row and row[0]:
+                    top_skills    = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+                    rising_skills = json.loads(row[1]) if isinstance(row[1], str) else (row[1] or [])
+                    logger.debug("gap_analyser.role_snapshot", role=role_cat)
+
+            if not top_skills:
+                # ── Strategy 3: global 'all' snapshot fallback ────────────────
+                row = conn.execute(text(f"""
+                    SELECT top_skills, rising_skills
+                    FROM {snap_t}
+                    WHERE role_category = 'all'
+                    ORDER BY week_start DESC LIMIT 1
+                """)).fetchone()
+                if row and row[0]:
+                    top_skills    = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+                    rising_skills = json.loads(row[1]) if isinstance(row[1], str) else (row[1] or [])
+                    logger.debug("gap_analyser.global_fallback")
+
+        if not top_skills:
             return None
-
-        top_skills    = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
-        rising_skills = json.loads(row[1]) if isinstance(row[1], str) else (row[1] or [])
 
         return {"top_skills": top_skills, "rising_skills": rising_skills}
 

@@ -56,6 +56,40 @@ _ACTION_VERBS: frozenset[str] = frozenset({
 _REQUIRED_SECTIONS: frozenset[str] = frozenset({"experience", "education", "skills"})
 _BONUS_SECTIONS:    frozenset[str] = frozenset({"summary", "certifications", "projects"})
 
+# ── Role normalisation ────────────────────────────────────────────────────────
+# Maps display names (from dashboard selectbox) and already-normalised slugs
+# to the role_category values stored in market.jobs / market.weekly_snapshots.
+_ROLE_MAP: dict[str, str] = {
+    "ml engineer":                "ml_engineer",
+    "data scientist":             "data_scientist",
+    "ai engineer":                "ai_engineer",
+    "mlops engineer":             "mlops_engineer",
+    "nlp engineer":               "nlp_engineer",
+    "computer vision engineer":   "computer_vision_engineer",
+    "research scientist":         "research_scientist",
+    "applied scientist":          "applied_scientist",
+    "data engineer":              "data_engineer",
+    "ai safety researcher":       "ai_safety_researcher",
+    "ai product manager":         "ai_product_manager",
+    # already-normalised slug pass-throughs
+    "ml_engineer":                "ml_engineer",
+    "data_scientist":             "data_scientist",
+    "ai_engineer":                "ai_engineer",
+    "mlops_engineer":             "mlops_engineer",
+    "nlp_engineer":               "nlp_engineer",
+    "computer_vision_engineer":   "computer_vision_engineer",
+    "research_scientist":         "research_scientist",
+    "applied_scientist":          "applied_scientist",
+    "data_engineer":              "data_engineer",
+    "ai_safety_researcher":       "ai_safety_researcher",
+    "ai_product_manager":         "ai_product_manager",
+}
+
+
+def _normalise_role(target_role: str) -> str:
+    """Map any display name / slug to a market.jobs role_category value."""
+    return _ROLE_MAP.get(target_role.lower().strip(), "other")
+
 # Pattern: numbers/metrics in text
 _METRIC_RE = re.compile(r"\d+\s*[%xX]|\d{4,}|\b\d+\s*(?:million|billion|k)\b", re.I)
 _DATE_RE   = re.compile(r"\b(20[0-2]\d|19\d\d)\b")
@@ -141,7 +175,12 @@ def _score_keywords(
 ) -> tuple[float, float]:
     """
     Compare CV skills against the market's top-demanded skills for target_role.
-    Falls back to role-agnostic top skills if no role-specific snapshot exists.
+
+    Query strategy (most specific → least specific):
+      1. Live job_skills JOIN jobs WHERE role_category = <normalised_role>
+      2. weekly_snapshots WHERE role_category = <normalised_role>
+      3. weekly_snapshots WHERE role_category = 'all'  (global fallback)
+
     Returns (score 0-100, raw_match_pct 0-100).
     """
     try:
@@ -151,27 +190,64 @@ def _score_keywords(
 
         engine    = get_sync_engine()
         is_sqlite = engine.dialect.name == "sqlite"
+        role_cat  = _normalise_role(target_role)
+        jobs_t    = "jobs"      if is_sqlite else "market.jobs"
+        skills_t  = "job_skills" if is_sqlite else "market.job_skills"
         snap_t    = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
 
-        with engine.connect() as conn:
-            row = conn.execute(
-                text(f"SELECT top_skills FROM {snap_t} ORDER BY week_start DESC LIMIT 1")
-            ).fetchone()
+        market_top: list[str] = []
 
-        if not row or not row[0]:
+        with engine.connect() as conn:
+            # ── Strategy 1: live per-role skill counts from job_skills ────────
+            rows = conn.execute(text(f"""
+                SELECT js.skill, COUNT(*) AS cnt
+                FROM {skills_t} js
+                JOIN {jobs_t} j ON j.job_id = js.job_id
+                WHERE j.role_category = :role
+                GROUP BY js.skill
+                ORDER BY cnt DESC
+                LIMIT 30
+            """), {"role": role_cat}).fetchall()
+
+            if rows:
+                market_top = [r[0] for r in rows]
+                logger.debug("ats.keywords.role_live", role=role_cat, count=len(market_top))
+            else:
+                # ── Strategy 2: role-specific weekly snapshot ─────────────────
+                row = conn.execute(text(f"""
+                    SELECT top_skills FROM {snap_t}
+                    WHERE role_category = :role
+                    ORDER BY week_start DESC LIMIT 1
+                """), {"role": role_cat}).fetchone()
+
+                if row and row[0]:
+                    ts = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    market_top = list(ts.keys())[:30]
+                    logger.debug("ats.keywords.role_snapshot", role=role_cat)
+
+            if not market_top:
+                # ── Strategy 3: global 'all' snapshot fallback ────────────────
+                row = conn.execute(text(f"""
+                    SELECT top_skills FROM {snap_t}
+                    WHERE role_category = 'all'
+                    ORDER BY week_start DESC LIMIT 1
+                """)).fetchone()
+                if row and row[0]:
+                    ts = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    market_top = list(ts.keys())[:30]
+                    logger.debug("ats.keywords.global_fallback")
+
+        if not market_top:
             return 50.0, 50.0
 
-        top_skills = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-        market_top = list(top_skills.keys())[:30]
-
-        found_lower  = {s.lower() for s in skills_found}
-        matches      = sum(1 for s in market_top if s.lower() in found_lower)
-        match_pct    = (matches / len(market_top)) * 100 if market_top else 0.0
+        found_lower = {s.lower() for s in skills_found}
+        matches     = sum(1 for s in market_top if s.lower() in found_lower)
+        match_pct   = (matches / len(market_top)) * 100 if market_top else 0.0
 
         missing_top = [s for s in market_top[:10] if s.lower() not in found_lower]
         if missing_top:
             issues.append(
-                f"Add these high-demand skills to your CV if you have them: "
+                f"Add these high-demand {target_role} skills to your CV if you have them: "
                 f"{', '.join(missing_top[:5])}"
             )
 
