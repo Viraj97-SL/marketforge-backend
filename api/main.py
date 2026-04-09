@@ -84,8 +84,11 @@ async def rate_limit_middleware(request: Request, call_next):
     ip  = request.client.host if request.client else "unknown"
     path = request.url.path
 
+    # CV analyse has its own per-endpoint limiter (3/hour) — skip middleware check
+    if path == "/api/v1/career/cv-analyse":
+        pass
     # Career advisor: 10 req/min (LLM-backed, expensive)
-    if path.startswith("/api/v1/career"):
+    elif path.startswith("/api/v1/career"):
         if not limiter.is_allowed(f"career:{ip}", limit=10, window_seconds=60):
             return PlainTextResponse("Rate limit exceeded", status_code=429)
 
@@ -784,13 +787,24 @@ async def analyse_cv(
     # ── Market match (SBERT) ───────────────────────────────────────────────────
     match_pct, _ = _compute_market_match(ats.skills_found or [target_role])
 
-    # ── Career gap analysis via LLM ────────────────────────────────────────────
+    # ── Phase 2: ML gap analysis (demand × salary × recency priority scoring) ──
+    from marketforge.cv.gap_analyser import analyse_gaps
+    ml_gaps     = analyse_gaps(ats.skills_found, target_role, top_n=15)
+    # ML-ranked missing skills (flat list for display, ordered by priority)
+    skills_missing = [g.skill for g in ml_gaps.top_n(10)]
+    # If DB has no market data yet fall back to simple heuristic
+    if not skills_missing:
+        skills_missing = [i["skill"] for i in _compute_skill_gaps(ats.skills_found, target_role)[:10]]
+
+    # ── Phase 2: LLM gap plan seeded with ML-bucketed skills ──────────────────
     gap_plan, narrative = await _generate_cv_gap_plan(
-        ats_score    = ats.total,
-        skills_found = ats.skills_found,
-        skills_missing = [i["skill"] for i in _compute_skill_gaps(ats.skills_found, target_role)[:8]],
-        target_role  = target_role,
-        match_pct    = match_pct,
+        ats_score      = ats.total,
+        skills_found   = ats.skills_found,
+        ml_short_term  = [g.skill for g in ml_gaps.short_term[:4]],
+        ml_mid_term    = [g.skill for g in ml_gaps.mid_term[:4]],
+        ml_long_term   = [g.skill for g in ml_gaps.long_term[:3]],
+        target_role    = target_role,
+        match_pct      = match_pct,
     )
 
     # ── Output guardrails ──────────────────────────────────────────────────────
@@ -802,6 +816,7 @@ async def analyse_cv(
         session=gdpr_ctx.session_token[:8],
         ats_score=ats.total,
         ats_grade=ats.grade,
+        ml_gaps_total=len(ml_gaps.all_gaps),
     )
 
     return CVAnalysisReport(
@@ -811,7 +826,7 @@ async def analyse_cv(
         ats_breakdown     = CVATSBreakdown(**ats.breakdown),
         ats_issues        = ats.issues,
         skills_found      = ats.skills_found,
-        skills_missing    = [i["skill"] for i in _compute_skill_gaps(ats.skills_found, target_role)[:10]],
+        skills_missing    = skills_missing,
         keyword_match_pct = ats.keyword_match_pct,
         market_match_pct  = round(match_pct, 1),
         gap_plan          = gap_plan,
@@ -824,17 +839,25 @@ async def analyse_cv(
 async def _generate_cv_gap_plan(
     ats_score:     float,
     skills_found:  list[str],
-    skills_missing:list[str],
+    ml_short_term: list[str],
+    ml_mid_term:   list[str],
+    ml_long_term:  list[str],
     target_role:   str,
     match_pct:     float,
 ) -> tuple[CVGapPlan, str]:
-    """LLM call to generate short/mid/long-term plan. Receives structured data only — no raw CV text."""
+    """
+    LLM call to generate short/mid/long-term plan.
+    Seeded with ML-ranked skill buckets from gap_analyser — receives structured data only,
+    never raw CV text.
+    """
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain_core.messages import HumanMessage
 
-        found_str   = ", ".join(skills_found[:15]) or "none detected"
-        missing_str = ", ".join(skills_missing[:8]) or "none"
+        found_str  = ", ".join(skills_found[:15]) or "none detected"
+        short_str  = ", ".join(ml_short_term) or "none identified"
+        mid_str    = ", ".join(ml_mid_term)   or "none identified"
+        long_str   = ", ".join(ml_long_term)  or "none identified"
 
         prompt = f"""You are a UK AI/ML career advisor. Generate a structured career development plan.
 
@@ -842,28 +865,30 @@ STRUCTURED DATA (use only this — do not invent facts):
 - ATS score: {ats_score:.0f}/100
 - Target role: {target_role}
 - Skills in CV: {found_str}
-- Top market skills missing from CV: {missing_str}
 - Market match: {match_pct:.0f}%
+- ML-ranked quick-win skills to add (0-3 months): {short_str}
+- ML-ranked medium-effort skills (3-12 months): {mid_str}
+- ML-ranked deep-expertise skills (12+ months): {long_str}
 
-Respond in this exact format (JSON-like sections):
+Respond in this exact format:
 
 NARRATIVE: [2 sentences: current position assessment based on ATS score and market match]
 
 SHORT_TERM (0-3 months):
-- [action 1]
+- [specific action for each skill listed above, e.g. courses/certs]
 - [action 2]
 - [action 3]
 
 MID_TERM (3-12 months):
-- [action 1]
+- [project or bootcamp for each skill listed]
 - [action 2]
 - [action 3]
 
 LONG_TERM (12+ months):
-- [action 1]
+- [advanced specialisation or portfolio for each skill listed]
 - [action 2]
 
-Keep each action specific and achievable. Do not mention company names."""
+Keep actions specific and achievable. Do not mention company names."""
 
         llm = ChatGoogleGenerativeAI(
             model=settings.llm.fast_model,
@@ -914,24 +939,31 @@ Keep each action specific and achievable. Do not mention company names."""
                 f"Prioritise adding the missing skills to close key gaps."
             )
 
+        # Fill empty LLM buckets with ML-seed defaults
+        def _seed(llm_items: list[str], ml_skills: list[str], verb: str) -> list[str]:
+            if llm_items:
+                return llm_items
+            return [f"{verb} {s}" for s in ml_skills[:3]] if ml_skills else [f"{verb} top missing skills"]
+
         return (
             CVGapPlan(
-                short_term = short_term or ["Complete a course in top missing skills", "Add metrics to all experience bullets", "Update LinkedIn to mirror CV keywords"],
-                mid_term   = mid_term   or ["Build a portfolio project using missing skills", "Contribute to open-source AI projects", "Obtain relevant certification"],
-                long_term  = long_term  or ["Target senior roles after closing skill gaps", "Build demonstrable track record with new skills"],
+                short_term = _seed(short_term, ml_short_term, "Complete a course or certification in"),
+                mid_term   = _seed(mid_term,   ml_mid_term,   "Build a portfolio project using"),
+                long_term  = _seed(long_term,  ml_long_term,  "Develop deep expertise in"),
             ),
             narrative,
         )
 
     except Exception as exc:
         logger.error("cv.gap_plan.error", error=str(exc))
+        # Graceful degradation: return ML-bucketed skills directly as actionable items
+        short_items = [f"Add {s} to your CV — quick course available" for s in ml_short_term[:3]] or ["Complete a course in top missing skills", "Add metrics to experience bullets", "Mirror job-ad keywords in CV"]
+        mid_items   = [f"Build a project demonstrating {s}" for s in ml_mid_term[:3]]   or ["Build portfolio project using missing skills", "Complete relevant certification"]
+        long_items  = [f"Develop deep expertise in {s}" for s in ml_long_term[:2]]      or ["Target senior roles after closing skill gaps"]
         return (
-            CVGapPlan(
-                short_term = ["Add missing skills to CV", "Improve ATS formatting", "Quantify achievements"],
-                mid_term   = ["Build portfolio projects", "Complete relevant certifications"],
-                long_term  = ["Target senior roles after 12 months of skill building"],
-            ),
-            f"CV scored {ats_score:.0f}/100 — address the listed issues to improve ATS compatibility.",
+            CVGapPlan(short_term=short_items, mid_term=mid_items, long_term=long_items),
+            f"CV scored {ats_score:.0f}/100 with a {match_pct:.0f}% market match for {target_role} roles. "
+            f"Address the skill gaps above to improve ATS compatibility.",
         )
 
 
