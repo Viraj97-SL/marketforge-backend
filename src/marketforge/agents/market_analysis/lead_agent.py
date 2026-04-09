@@ -72,7 +72,7 @@ class SkillDemandAnalystAgent(DeepAgent):
         engine = _engine()
 
         with engine.connect() as conn:
-            # Current week skill counts
+            # ── Global (all roles) current week skill counts ───────────────────
             curr_rows = conn.execute(text(f"""
                 SELECT js.skill, COUNT(*) as cnt
                 FROM {_t('job_skills')} js
@@ -92,8 +92,27 @@ class SkillDemandAnalystAgent(DeepAgent):
                 GROUP BY js.skill
             """), {"prev": prev, "curr": week}).fetchall()
 
+            # ── Per-role skill counts ──────────────────────────────────────────
+            role_rows = conn.execute(text(f"""
+                SELECT j.role_category, js.skill, COUNT(*) as cnt
+                FROM {_t('job_skills')} js
+                JOIN {_t('jobs')} j ON j.job_id = js.job_id
+                WHERE j.scraped_at >= :since
+                  AND j.role_category IS NOT NULL
+                  AND j.role_category != 'other'
+                GROUP BY j.role_category, js.skill
+                ORDER BY j.role_category, cnt DESC
+            """), {"since": week}).fetchall()
+
         curr_map = {r[0]: r[1] for r in curr_rows}
         prev_map = {r[0]: r[1] for r in prev_rows}
+
+        # Build per-role top-skills dict: {role_category: {skill: count}}
+        role_skills: dict[str, dict[str, int]] = {}
+        for role, skill, cnt in role_rows:
+            role_skills.setdefault(role, {})[skill] = cnt
+        # Keep only top 50 per role
+        role_skills = {r: dict(list(s.items())[:50]) for r, s in role_skills.items()}
 
         # Changepoint detection: flag skills moving > 50% relative to prior week
         rising, declining = [], []
@@ -113,6 +132,7 @@ class SkillDemandAnalystAgent(DeepAgent):
             "rising_skills":   rising[:20],
             "declining_skills":declining[:20],
             "prev_map":        prev_map,
+            "role_skills":     role_skills,   # per-role breakdown
         }
 
     async def reflect(
@@ -959,8 +979,29 @@ class MarketAnalystLeadAgent(DeepAgent):
             "top_cities":       geo_out.get("top_cities", {}),
         }
 
-        # Persist snapshot
+        # Persist global 'all' snapshot
         self._write_snapshot(snapshot)
+
+        # Persist per-role snapshots so CV analyser can query role-specific data
+        role_skills = skill_out.get("role_skills", {})
+        for role_cat, top_skills in role_skills.items():
+            if not top_skills:
+                continue
+            role_snap = {
+                "week_start":       week,
+                "role_category":    role_cat,
+                "top_skills":       top_skills,
+                "rising_skills":    [],   # velocity per-role not yet tracked
+                "declining_skills": [],
+                "salary_p25":       None,
+                "salary_p50":       None,
+                "salary_p75":       None,
+                "salary_sample_size": 0,
+                "job_count":        sum(top_skills.values()),
+                "sponsorship_rate": 0,
+                "top_cities":       {},
+            }
+            self._write_snapshot(role_snap)
 
         return {
             "snapshot":             snapshot,
