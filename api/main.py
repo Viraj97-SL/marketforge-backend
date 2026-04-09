@@ -3,6 +3,7 @@ MarketForge AI — FastAPI Application
 
 Endpoints:
   POST /api/v1/career/analyse     — personalised career advice (LLM-backed)
+  POST /api/v1/career/cv-analyse  — CV upload → ATS score + career gap plan
   GET  /api/v1/market/skills      — top skills by role category
   GET  /api/v1/market/salary      — salary benchmarks
   GET  /api/v1/market/snapshot    — full weekly market snapshot
@@ -20,7 +21,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
 import structlog
-from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
@@ -682,6 +683,256 @@ async def health() -> HealthResponse:
         jobs_total=int(total_jobs),
         version="0.1.0",
     )
+
+
+# ── CV Upload + ATS Score + Career Gap endpoint ───────────────────────────────
+
+class CVATSBreakdown(BaseModel):
+    keyword_match: float
+    structure:     float
+    readability:   float
+    completeness:  float
+    format_safety: float
+
+
+class CVGapPlan(BaseModel):
+    short_term: list[str]   # 0–3 months
+    mid_term:   list[str]   # 3–12 months
+    long_term:  list[str]   # 12+ months
+
+
+class CVAnalysisReport(BaseModel):
+    session_token:     str              # anonymous, no PII
+    ats_score:         float            # 0–100
+    ats_grade:         str              # A+/A/B/C/D
+    ats_breakdown:     CVATSBreakdown
+    ats_issues:        list[str]        # actionable fix suggestions
+    skills_found:      list[str]        # skills extracted from CV
+    skills_missing:    list[str]        # top market skills not in CV
+    keyword_match_pct: float
+    market_match_pct:  float
+    gap_plan:          CVGapPlan
+    narrative_summary: str
+    pii_scrubbed:      list[str]        # PII types that were found and stripped
+    data_retained:     bool = False     # always False — GDPR guarantee
+
+
+@app.post(
+    "/api/v1/career/cv-analyse",
+    response_model=CVAnalysisReport,
+    summary="CV upload → ATS score + career gap analysis",
+    description=(
+        "Upload a CV (PDF or DOCX, max 5 MB) and receive an ATS compatibility score, "
+        "skill gap analysis, and a short/mid/long-term career plan. "
+        "No CV data is stored — processing is in-memory only (GDPR compliant)."
+    ),
+)
+async def analyse_cv(
+    request:     Request,
+    cv_file:     UploadFile = File(..., description="PDF or DOCX CV, max 5 MB"),
+    target_role: str        = "ml_engineer",
+    consent:     bool       = False,
+) -> CVAnalysisReport:
+    from marketforge.cv.scanner  import scan_file
+    from marketforge.cv.parser   import parse_cv
+    from marketforge.cv.ats_scorer import score_cv
+    from marketforge.cv.gdpr     import build_gdpr_context, ConsentNotGiven
+
+    ip = request.client.host if request.client else "unknown"
+
+    # ── Rate limit: 3 CV analyses per IP per hour (expensive operation) ────────
+    if not limiter.is_allowed(f"cv_analyse:{ip}", limit=3, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="CV analysis rate limit exceeded (3/hour)")
+
+    # ── GDPR consent gate ─────────────────────────────────────────────────────
+    if not consent:
+        raise HTTPException(
+            status_code=403,
+            detail="GDPR consent is required. Set consent=true to confirm you agree to the privacy notice.",
+        )
+
+    # ── Read file into memory (never touch disk) ──────────────────────────────
+    raw_bytes = await cv_file.read()
+
+    # ── Security scan ─────────────────────────────────────────────────────────
+    scan = scan_file(raw_bytes)
+    if not scan.allowed:
+        logger.warning("cv.endpoint.scan_rejected", reason=scan.rejection_reason, ip=ip)
+        raise HTTPException(
+            status_code=422,
+            detail=f"File rejected by security scan: {scan.rejection_reason}",
+        )
+
+    # ── Parse CV ──────────────────────────────────────────────────────────────
+    cv = parse_cv(raw_bytes, scan.file_type)
+    if cv.error:
+        raise HTTPException(status_code=422, detail=f"CV could not be parsed: {cv.error}")
+
+    # ── GDPR: strip PII before any further processing ─────────────────────────
+    try:
+        gdpr_ctx = build_gdpr_context(cv.raw_text, scan.file_hash, consent=True)
+    except ConsentNotGiven:
+        raise HTTPException(status_code=403, detail="Consent check failed")
+
+    # Replace raw_text with scrubbed version; drop original reference
+    cv.raw_text = gdpr_ctx.scrubbed_text
+    del raw_bytes   # discard original bytes
+
+    # ── ATS scoring ────────────────────────────────────────────────────────────
+    ats = score_cv(cv, target_role)
+
+    # ── Market match (SBERT) ───────────────────────────────────────────────────
+    match_pct, _ = _compute_market_match(ats.skills_found or [target_role])
+
+    # ── Career gap analysis via LLM ────────────────────────────────────────────
+    gap_plan, narrative = await _generate_cv_gap_plan(
+        ats_score    = ats.total,
+        skills_found = ats.skills_found,
+        skills_missing = [i["skill"] for i in _compute_skill_gaps(ats.skills_found, target_role)[:8]],
+        target_role  = target_role,
+        match_pct    = match_pct,
+    )
+
+    # ── Output guardrails ──────────────────────────────────────────────────────
+    from marketforge.agents.security.guardrails import validate_output
+    narrative, _ = validate_output(narrative)
+
+    logger.info(
+        "cv.endpoint.complete",
+        session=gdpr_ctx.session_token[:8],
+        ats_score=ats.total,
+        ats_grade=ats.grade,
+    )
+
+    return CVAnalysisReport(
+        session_token     = gdpr_ctx.session_token,
+        ats_score         = ats.total,
+        ats_grade         = ats.grade,
+        ats_breakdown     = CVATSBreakdown(**ats.breakdown),
+        ats_issues        = ats.issues,
+        skills_found      = ats.skills_found,
+        skills_missing    = [i["skill"] for i in _compute_skill_gaps(ats.skills_found, target_role)[:10]],
+        keyword_match_pct = ats.keyword_match_pct,
+        market_match_pct  = round(match_pct, 1),
+        gap_plan          = gap_plan,
+        narrative_summary = narrative,
+        pii_scrubbed      = gdpr_ctx.pii_types_found,
+        data_retained     = False,
+    )
+
+
+async def _generate_cv_gap_plan(
+    ats_score:     float,
+    skills_found:  list[str],
+    skills_missing:list[str],
+    target_role:   str,
+    match_pct:     float,
+) -> tuple[CVGapPlan, str]:
+    """LLM call to generate short/mid/long-term plan. Receives structured data only — no raw CV text."""
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.messages import HumanMessage
+
+        found_str   = ", ".join(skills_found[:15]) or "none detected"
+        missing_str = ", ".join(skills_missing[:8]) or "none"
+
+        prompt = f"""You are a UK AI/ML career advisor. Generate a structured career development plan.
+
+STRUCTURED DATA (use only this — do not invent facts):
+- ATS score: {ats_score:.0f}/100
+- Target role: {target_role}
+- Skills in CV: {found_str}
+- Top market skills missing from CV: {missing_str}
+- Market match: {match_pct:.0f}%
+
+Respond in this exact format (JSON-like sections):
+
+NARRATIVE: [2 sentences: current position assessment based on ATS score and market match]
+
+SHORT_TERM (0-3 months):
+- [action 1]
+- [action 2]
+- [action 3]
+
+MID_TERM (3-12 months):
+- [action 1]
+- [action 2]
+- [action 3]
+
+LONG_TERM (12+ months):
+- [action 1]
+- [action 2]
+
+Keep each action specific and achievable. Do not mention company names."""
+
+        llm = ChatGoogleGenerativeAI(
+            model=settings.llm.fast_model,
+            google_api_key=settings.llm.gemini_api_key,
+            temperature=0.2,
+        )
+        response = llm.invoke([HumanMessage(content=prompt)])
+        text     = response.content.strip()
+
+        # Parse structured sections
+        def _extract_bullets(section_text: str) -> list[str]:
+            return [
+                line.strip().lstrip("-•*123456789. ").strip()
+                for line in section_text.split("\n")
+                if line.strip() and line.strip()[0] in "-•*123456789"
+            ][:3]
+
+        narrative  = ""
+        short_term: list[str] = []
+        mid_term:   list[str] = []
+        long_term:  list[str] = []
+
+        current_section = ""
+        for line in text.split("\n"):
+            if line.startswith("NARRATIVE:"):
+                narrative = line.replace("NARRATIVE:", "").strip()
+                current_section = "narrative"
+            elif "SHORT_TERM" in line:
+                current_section = "short"
+            elif "MID_TERM" in line:
+                current_section = "mid"
+            elif "LONG_TERM" in line:
+                current_section = "long"
+            elif line.strip().startswith("-") or line.strip().startswith("•"):
+                item = line.strip().lstrip("-• ").strip()
+                if item:
+                    if current_section == "short":
+                        short_term.append(item)
+                    elif current_section == "mid":
+                        mid_term.append(item)
+                    elif current_section == "long":
+                        long_term.append(item)
+
+        if not narrative:
+            narrative = (
+                f"Your CV scores {ats_score:.0f}/100 for ATS compatibility with a "
+                f"{match_pct:.0f}% market match for {target_role} roles. "
+                f"Prioritise adding the missing skills to close key gaps."
+            )
+
+        return (
+            CVGapPlan(
+                short_term = short_term or ["Complete a course in top missing skills", "Add metrics to all experience bullets", "Update LinkedIn to mirror CV keywords"],
+                mid_term   = mid_term   or ["Build a portfolio project using missing skills", "Contribute to open-source AI projects", "Obtain relevant certification"],
+                long_term  = long_term  or ["Target senior roles after closing skill gaps", "Build demonstrable track record with new skills"],
+            ),
+            narrative,
+        )
+
+    except Exception as exc:
+        logger.error("cv.gap_plan.error", error=str(exc))
+        return (
+            CVGapPlan(
+                short_term = ["Add missing skills to CV", "Improve ATS formatting", "Quantify achievements"],
+                mid_term   = ["Build portfolio projects", "Complete relevant certifications"],
+                long_term  = ["Target senior roles after 12 months of skill building"],
+            ),
+            f"CV scored {ats_score:.0f}/100 — address the listed issues to improve ATS compatibility.",
+        )
 
 
 # ── Prometheus metrics ────────────────────────────────────────────────────────
