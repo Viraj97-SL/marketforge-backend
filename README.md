@@ -1,260 +1,53 @@
-# MarketForge AI
+# MarketForge Backend
 
-**UK AI Job Market Intelligence Platform**
+**FastAPI + APScheduler deployment layer for MarketForge AI**
 
-Autonomous multi-department agentic AI system that continuously monitors, analyses, and distils the UK AI/ML job market into actionable intelligence. Nine specialised departments — each a LangGraph DeepAgent hierarchy — run on a twice-weekly schedule and produce skill demand rankings, salary benchmarks, sponsorship rates, career gap analysis, and emerging research signals.
+This repo is the production backend service. It contains no agent code — all intelligence lives in the [`marketforge-ai`](https://github.com/Viraj97-SL/marketforge-ai) core package, which this service installs as a git dependency.
 
-[![CI](https://github.com/viraj97-sl/marketforge-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/viraj97-sl/marketforge-ai/actions)
-![Python 3.11](https://img.shields.io/badge/python-3.11-blue)
-![LangGraph](https://img.shields.io/badge/LangGraph-0.2.x-green)
-![PostgreSQL 16](https://img.shields.io/badge/PostgreSQL-16-blue)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.111-green)](https://fastapi.tiangolo.com)
+[![Railway](https://img.shields.io/badge/deploy-Railway-blueviolet)](https://railway.app)
 
 ---
 
-## What It Does
+## Repository layout (3-repo architecture)
 
-| Capability | Detail |
+| Repo | Purpose |
 |---|---|
-| **Job ingestion** | Scrapes Adzuna, Reed, Wellfound, specialist boards — ~200–800 roles/run |
-| **NLP extraction** | 3-gate pipeline: taxonomy exact match → spaCy NER → Gemini LLM fallback |
-| **Market analysis** | Skill demand index, salary percentiles, sponsorship rates, city distribution |
-| **Career advisor** | Enter skills manually → AI gap analysis benchmarked against live data |
-| **CV analyser** | Upload PDF/DOCX → instant ATS score (0–100, A+→D), skill gap plan (short/mid/long-term), GDPR-compliant |
-| **Research signals** | arXiv + tech blogs monitored; predicts emerging skills 4–8 weeks early |
-| **Weekly report** | Auto-generated LinkedIn-quality market briefing |
-| **Dashboard** | 7-page Streamlit UI — Market Overview, Skill Intelligence, Salary & Geography, Career Advisor, Research Signals, Job Board, Pipeline Status |
-| **REST API** | FastAPI with rate limiting, PII scrubbing, prompt injection guardrails |
+| [`marketforge-ai`](https://github.com/Viraj97-SL/marketforge-ai) | Core package — all 9 LangGraph agents, ML/NLP pipelines |
+| **`marketforge-backend`** ← you are here | FastAPI API + APScheduler worker — deployed to Railway |
+| `marketforge-frontend` | Next.js frontend |
 
 ---
 
-## Architecture
-
-Nine departments, each a LangGraph DeepAgent hierarchy running a Plan → Execute → Reflect → Output lifecycle. All state persists in the `market` schema in PostgreSQL.
+## What this repo contains
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Apache Airflow (scheduler)                  │
-│                                                                 │
-│  dag_ingest_primary ─► dag_weekly_analysis ─► dag_model_retrain│
-└──────────────┬──────────────────────────────────────────────────┘
-               │
-   ┌───────────▼───────────────────────────────────────────────┐
-   │                    LangGraph DAG                          │
-   │                                                           │
-   │  [1] Data Collection  →  [2] ML Engineering               │
-   │          ↓                       ↓                        │
-   │  [3] Market Analysis  →  [4] Research Intelligence        │
-   │          ↓                       ↓                        │
-   │  [5] Content Studio   ←  [6] User Insights                │
-   │                                                           │
-   │  [7] QA & Testing   [8] Security   [9] Ops & Observability│
-   └───────────────────────────────────────────────────────────┘
-               │
-   ┌───────────▼───────────────┐    ┌────────────────────────┐
-   │  PostgreSQL (market.*)    │    │  Redis (dashboard cache)│
-   │  • jobs                   │    └────────────────────────┘
-   │  • job_skills             │    ┌────────────────────────┐
-   │  • weekly_snapshots       │    │  ChromaDB (embeddings) │
-   │  • research_signals       │    └────────────────────────┘
-   │  • pipeline_runs          │    ┌────────────────────────┐
-   │  • agent_state            │    │  MLflow (model registry│
-   └───────────────────────────┘    └────────────────────────┘
-```
-
-| # | Department | Lead Agent | Responsibility |
-|---|---|---|---|
-| 1 | Data Collection | `DataCollectionLeadAgent` | Ingest 15+ UK job sources via connectors |
-| 2 | ML Engineering | `MLEngineerLeadAgent` | Feature engineering, skill extraction model, salary prediction, hiring velocity forecast |
-| 3 | Market Analysis | `MarketAnalystLeadAgent` | Skill demand trends, salary intelligence, sponsorship tracking, geo distribution |
-| 4 | Research Intelligence | `ResearchLeadAgent` | arXiv monitoring, emerging tech signal detection |
-| 5 | Content Studio | `ContentLeadAgent` | Weekly LinkedIn-quality market report |
-| 6 | User Insights | `UserInsightsLeadAgent` | Personalised career gap analysis via API |
-| 7 | QA & Testing | `QALeadAgent` | Data integrity, LLM output validation, model drift detection |
-| 8 | Security | `SecurityLeadAgent` | Input sanitisation, PII scrubbing, prompt injection defence |
-| 9 | Ops & Observability | `OpsLeadAgent` | Cost tracking, pipeline health, alert dispatch |
-
----
-
-## Tech Stack
-
-| Layer | Technology | Version |
-|---|---|---|
-| Agent orchestration | LangGraph | 0.2.x |
-| Pipeline scheduling | Apache Airflow | 2.9.x |
-| LLM | Google Gemini Flash 2.0 + Pro | — |
-| LLM observability | LangSmith | — |
-| ML tracking | MLflow | 2.x |
-| NLP (gate 2) | spaCy + en_core_web_sm | 3.8.x |
-| Embeddings / dedup | sentence-transformers MiniLM | 3.x |
-| Taxonomy matching | flashtext | 2.7 |
-| Primary database | PostgreSQL + pgvector | 16 |
-| Vector store | ChromaDB | — |
-| Cache | Redis | 7.x |
-| REST API | FastAPI + uvicorn | — |
-| Dashboard | Streamlit | — |
-| Containerisation | Docker Compose | — |
-| Metrics | Prometheus | 2.52 |
-
----
-
-## Project Structure
-
-```
-marketforge-ai/
+marketforge-backend/
 ├── api/
-│   ├── main.py              # FastAPI app — 8 endpoints incl. CV analysis
-│   └── security.py          # Rate limiting, auth middleware
-├── airflow/
-│   └── dags/                # 5 Airflow DAG definitions
-├── dashboard/
-│   └── app.py               # 7-page Streamlit dashboard
-├── scripts/
-│   ├── bootstrap.py         # DB init + taxonomy seed
-│   ├── run_pipeline.py      # Manual one-shot pipeline runner
-│   └── init_schemas.sql     # PostgreSQL DDL bootstrap
-├── src/marketforge/
-│   ├── agents/              # 9 departments, each with sub-agents + lead
-│   │   ├── data_collection/
-│   │   ├── ml_engineering/
-│   │   ├── market_analysis/
-│   │   ├── research_intelligence/
-│   │   ├── content_studio/
-│   │   ├── user_insights/
-│   │   ├── qa/
-│   │   ├── security/
-│   │   └── ops/
-│   ├── memory/
-│   │   ├── postgres.py      # JobStore, SnapshotStore, PipelineRunStore
-│   │   └── redis_cache.py   # DashboardCache with TTL + invalidation
-│   ├── models/
-│   │   ├── job.py           # RawJob, EnrichedJob, MarketSnapshot, …
-│   │   └── state.py         # LangGraph state TypedDicts
-│   ├── cv/                  # CV analysis module (GDPR-compliant, in-memory only)
-│   │   ├── scanner.py       # Security gate: magic bytes, PDF JS, DOCX macros, ClamAV
-│   │   ├── parser.py        # PDF (pdfplumber → pypdf fallback) + DOCX extraction
-│   │   ├── ats_scorer.py    # 5-dimension ATS scoring: keywords/structure/readability/completeness/format
-│   │   ├── gdpr.py          # PII scrubbing, consent gate, anonymous session token
-│   │   └── gap_analyser.py  # ML gap prioritisation — demand×salary×recency scoring
-│   ├── nlp/
-│   │   ├── extractor.py     # NLP pipeline coordinator
-│   │   └── taxonomy.py      # Gate1 (flashtext), Gate2 (spaCy), Gate3 (Gemini)
-│   └── config.py            # Settings (Pydantic BaseSettings)
-├── docker-compose.yml       # Full local stack
-├── Dockerfile
-├── pyproject.toml
-└── .env                     # API keys + DB URLs (never commit)
+│   ├── main.py          # FastAPI app — 9 endpoints (career, market, CV, health, metrics)
+│   └── security.py      # Rate limiting middleware + LangGraph security pipeline wiring
+├── worker.py            # APScheduler pipeline worker (replaces Airflow for Railway)
+├── scripts/             # DB bootstrap, migration helpers
+├── tests/               # API + integration tests
+├── Dockerfile           # Multi-service Railway build
+├── railway.toml         # Railway service config (api + worker services)
+├── requirements.txt     # Heavy dep pre-install for Docker layer caching
+└── pyproject.toml       # Slim manifest — core installed from git
 ```
 
 ---
 
-## Quick Start
+## Core dependency
 
-### Prerequisites
+All agent, graph, ML, and NLP code is installed from the core package:
 
-- Python 3.11
-- Docker Desktop (for PostgreSQL, Redis, Airflow)
-- Google Gemini API key (free tier sufficient)
-- Adzuna API key (free — [register here](https://developer.adzuna.com/))
-- Reed API key (free — [register here](https://www.reed.co.uk/developers/jobseeker))
-
-### 1 — Clone and create virtual environment
-
-```bash
-git clone https://github.com/viraj97-sl/marketforge-ai.git
-cd marketforge-ai
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
-
-pip install -e ".[dev]"
+```toml
+# pyproject.toml
+"marketforge-ai @ git+https://github.com/Viraj97-SL/marketforge-ai.git@main"
 ```
 
-### 2 — Install NLP models
-
-```bash
-python -m spacy download en_core_web_sm
-pip install sentence-transformers langchain-google-genai
-```
-
-### 3 — Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` — minimum required keys:
-
-```env
-# Database
-DATABASE_URL=postgresql+asyncpg://marketforge:marketforge@localhost:5432/marketforge
-DATABASE_URL_SYNC=postgresql+psycopg2://marketforge:marketforge@localhost:5432/marketforge
-
-# Redis
-REDIS_URL=redis://localhost:6379/0
-
-# LLMs
-GOOGLE_API_KEY=your_gemini_api_key
-
-# Job board connectors
-ADZUNA_APP_ID=your_adzuna_app_id
-ADZUNA_APP_KEY=your_adzuna_app_key
-REED_API_KEY=your_reed_api_key
-
-# Optional (LangSmith tracing)
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_API_KEY=your_langsmith_key
-LANGCHAIN_PROJECT=marketforge-ai
-```
-
-### 4 — Start infrastructure
-
-```bash
-docker-compose up -d postgres redis
-```
-
-Wait ~10 seconds for PostgreSQL to initialise, then:
-
-```bash
-python scripts/bootstrap.py
-```
-
-This creates all tables, seeds the skill taxonomy, and verifies connectivity.
-
-### 5 — Run the first pipeline
-
-```bash
-python scripts/run_pipeline.py
-```
-
-Expect ~2–5 minutes. Typical output:
-```
-[pipeline] Ingested 312 raw jobs
-[nlp] gate1=287 gate2=14 gate3=4 total_skills=1842
-[analysis] Snapshot written — week 2026-04-07
-[cache] Redis invalidated
-```
-
-### 6 — Start the API
-
-```bash
-# Windows
-$env:PYTHONPATH="src"; uvicorn api.main:app --reload
-
-# macOS / Linux
-PYTHONPATH=src uvicorn api.main:app --reload
-```
-
-API available at `http://localhost:8000`. Docs at `http://localhost:8000/docs`.
-
-### 7 — Start the dashboard
-
-```bash
-streamlit run dashboard/app.py
-```
-
-Dashboard at `http://localhost:8501`.
+When Railway builds the Docker image, it pulls the core package at the pinned branch/commit. No agent code is duplicated here.
 
 ---
 
@@ -265,109 +58,114 @@ Dashboard at `http://localhost:8501`.
 | `GET` | `/api/v1/health` | System status, data freshness, job count |
 | `GET` | `/api/v1/market/snapshot` | Latest weekly snapshot (skills, salary, sponsorship) |
 | `GET` | `/api/v1/market/skills` | Skill demand by role category |
-| `GET` | `/api/v1/market/trending` | Rising / declining skills (week-on-week) |
-| `POST` | `/api/v1/career/analyse` | Career gap analysis for a given skill set |
-| `POST` | `/api/v1/career/cv-analyse` | Upload CV (PDF/DOCX) → ATS score + gap plan (GDPR-compliant, no data stored) |
-| `GET` | `/api/v1/jobs` | Browse indexed jobs with filters |
-| `GET` | `/api/v1/pipeline/runs` | Recent pipeline execution history |
+| `GET` | `/api/v1/market/salary` | Salary benchmarks by role |
+| `GET` | `/api/v1/market/trending` | Rising / declining skills week-on-week |
+| `POST` | `/api/v1/career/analyse` | Personalised career gap analysis (SBERT + Gemini 2.5 Pro) |
+| `POST` | `/api/v1/career/cv-analyse` | Upload PDF/DOCX → ATS score + skill gap plan (GDPR, no data stored) |
+| `GET` | `/api/v1/jobs` | Browse indexed roles with filters |
+| `GET` | `/metrics` | Prometheus metrics |
+
+All user-facing inputs pass through the LangGraph Department 8 security graph (`run_security_check()`) before any LLM call.
 
 ---
 
-## Pipeline Schedule
+## Pipeline schedule (APScheduler)
 
-Airflow runs automatically when `docker-compose up -d` includes the Airflow services:
+`worker.py` runs as a long-lived Railway service. It calls the LangGraph pipeline entry points on the same schedule the Airflow DAGs used:
 
 ```
-Tuesday  07:00 UTC  — dag_ingest_primary     (Mon/Tue peak volume)
-Thursday 07:00 UTC  — dag_ingest_primary     (Wed/Thu volume)
-Monday   07:00 UTC  — dag_weekly_analysis    (weekly report + snapshot)
-Sunday   02:00 UTC  — dag_model_retrain      (off-peak ML cycle)
-Every 6h            — dag_dashboard_refresh  (cache refresh)
+Tuesday + Thursday  07:00 UTC  — run_data_collection_pipeline()
+                                 run_market_analysis_pipeline()    (full ingest)
+Monday              07:00 UTC  — run_market_analysis_pipeline()    (snapshot only)
+Sunday              02:00 UTC  — run_ml_pipeline()                 (PSI drift → retrain)
+Every 6h                       — Redis cache refresh
 ```
 
-For one-off runs use `python scripts/run_pipeline.py`.
+Trigger manually: `python worker.py --run-now ingest|analysis|retrain|cache`
 
 ---
 
-## Dashboard Pages
+## Railway deployment
 
-| Page | What you see |
+Two services are deployed from this repo — configure both in the Railway dashboard:
+
+| Service | Start command |
 |---|---|
-| **Market Overview** | Top 20 skills bar chart, rising/declining skill signals, KPI strip |
-| **Skill Intelligence** | Demand index table, treemap visualisation, week-on-week trend signals |
-| **Salary & Geography** | Salary box plot (P25/P50/P75), sponsorship gauge, city bar chart |
-| **Career Advisor** | Enter your skills → AI gap analysis, 90-day action plan, sector fit |
-| **Research Signals** | Emerging techniques from arXiv + blogs before they appear in job ads |
-| **Job Board** | Browse all indexed roles with filters; links to original job postings |
-| **Pipeline Status** | Run history, LLM cost tracker, per-agent health monitor |
+| `api` | `uvicorn api.main:app --host 0.0.0.0 --port $PORT` |
+| `worker` | `python worker.py` |
 
----
+Both services share the same PostgreSQL and Redis addons (Railway injects `DATABASE_URL` and `REDIS_URL` automatically).
 
-## NLP Extraction Pipeline
+**LangGraph checkpointing:** `AsyncPostgresSaver` automatically uses `DATABASE_URL` for graph state persistence. All 8 pipeline graphs checkpoint to PostgreSQL — node-level retry is possible without re-running the full pipeline.
 
-Three-gate skill extraction runs on every ingested job description:
+**LangSmith tracing:** set `LANGCHAIN_TRACING_V2=true`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT=marketforge-ai` in the Railway environment. Every pipeline run traces to [studio.langsmith.com](https://studio.langsmith.com) automatically.
 
-```
-Description text
-      │
-      ▼
- Gate 1 — flashtext taxonomy match (fast, zero-cost)
-      │  ~85–90% of extractions
-      ▼
- Gate 2 — spaCy NER (en_core_web_sm) — catches novel entities
-      │  ~8–12% of extractions
-      ▼
- Gate 3 — Gemini Flash LLM fallback (highest recall, ~$0.002/job)
-           ~2–5% of extractions
-```
+### Environment variables (set in Railway dashboard)
 
----
-
-## Cost Model
-
-| Item | Cost |
+| Variable | Source |
 |---|---|
-| Gemini Flash (gate 3, ~50 jobs/run) | ~$0.02/run |
-| Gemini Pro (career analysis, on-demand) | ~$0.01/query |
-| PostgreSQL (Railway free tier) | $0/month |
-| Redis (Railway free tier) | $0/month |
-| **Total at 2 runs/week** | **~$0.20–0.40/month** |
-
-Well within the $5/month infrastructure budget.
-
----
-
-## Local Services
-
-| Service | URL | Credentials |
-|---|---|---|
-| Dashboard | http://localhost:8501 | — |
-| FastAPI | http://localhost:8000/docs | — |
-| Airflow | http://localhost:8080 | admin / admin |
-| MLflow | http://localhost:5001 | — |
-| Prometheus | http://localhost:9090 | — |
-| PostgreSQL | localhost:5432 | marketforge / marketforge |
-| Redis | localhost:6379 | — |
+| `DATABASE_URL` | Auto-injected by Railway PostgreSQL addon |
+| `REDIS_URL` | Auto-injected by Railway Redis addon |
+| `GEMINI_API_KEY` | Google AI Studio |
+| `LANGCHAIN_API_KEY` | LangSmith |
+| `LANGCHAIN_TRACING_V2` | `true` |
+| `LANGCHAIN_PROJECT` | `marketforge-ai` |
+| `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` | Adzuna developer portal |
+| `REED_API_KEY` | Reed developer portal |
+| `TAVILY_API_KEY` | Tavily |
+| `SMTP_*` | Gmail app password for weekly report dispatch |
+| `ENVIRONMENT` | `production` |
 
 ---
 
-## Build Phases
+## Local development
 
-- **Phase 1** — Data Foundation: PostgreSQL schema, skill taxonomy, 4 connectors, NLP gates 1+2
-- **Phase 2** — Analysis Core: Market Analysis dept, Redis cache, MLflow, basic dashboard
-- **Phase 3** — Agentic Intelligence: ML Engineering, Research Intelligence, Content Studio, LangSmith tracing
-- **Phase 4** — User Features: Career Advisor API, Security dept, FastAPI hardening
-- **Phase 5** — CV Analyser: ATS scoring, GDPR-compliant CV upload, ML gap prioritisation, Next.js frontend integration
-- **Phase 6** *(ongoing)* — Ops dept, remaining connectors, Grafana, public launch
+```bash
+git clone https://github.com/Viraj97-SL/marketforge-backend.git
+cd marketforge-backend
+python -m venv .venv && .venv\Scripts\activate   # Windows
+# source .venv/bin/activate                      # macOS / Linux
+
+pip install -e ".[dev]"
+python -m spacy download en_core_web_sm
+```
+
+Create `.env` (copy the vars from Railway dashboard or from the core repo's env):
+
+```env
+DATABASE_URL=postgresql+asyncpg://marketforge:marketforge@localhost:5432/marketforge
+DATABASE_URL_SYNC=postgresql+psycopg2://marketforge:marketforge@localhost:5432/marketforge
+REDIS_URL=redis://localhost:6379/0
+GEMINI_API_KEY=your_key
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=your_langsmith_key
+LANGCHAIN_PROJECT=marketforge-ai
+ADZUNA_APP_ID=...
+ADZUNA_APP_KEY=...
+REED_API_KEY=...
+```
+
+Start local PostgreSQL + Redis:
+
+```bash
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=marketforge postgres:16
+docker run -d -p 6379:6379 redis:7
+```
+
+Run the API:
+
+```bash
+uvicorn api.main:app --reload --port 8000
+```
+
+Run the worker (one-shot):
+
+```bash
+python worker.py --run-now ingest
+```
 
 ---
 
 ## Author
 
 Viraj Bulugahapitiya · MSc Data Science (University of Hertfordshire) · 2026
-
-Portfolio project demonstrating production-grade AI engineering: multi-agent orchestration, NLP pipelines, async FastAPI, PostgreSQL, Redis, Docker, MLflow, LangSmith, and Streamlit — all on a sub-$5/month infrastructure budget.
-
----
-
-*Specification: [MarketForge_AI_Software_Spec_v1.0](docs/MarketForge_AI_Software_Spec_v1_0.docx)*

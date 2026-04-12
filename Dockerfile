@@ -18,7 +18,7 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 
 # Copy source
 COPY . .
-RUN pip install --no-cache-dir -e . || true
+RUN pip install --no-cache-dir -e .
 
 # Bootstrap DB schema (idempotent)
 RUN python scripts/bootstrap.py || echo "[WARN] Bootstrap deferred to first start"
