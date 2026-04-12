@@ -5,6 +5,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["api"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [project]
 name = "marketforge-backend"
 version = "0.1.0"
