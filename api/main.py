@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from marketforge.agents.security.guardrails import validate_input
+from marketforge.agents.graphs.security import run_security_check
 from marketforge.config.settings import settings
 from marketforge.memory.postgres import init_database
 from marketforge.memory.redis_cache import DashboardCache, RateLimiter
@@ -153,16 +153,19 @@ class HealthResponse(BaseModel):
 async def analyse_career(profile: UserProfile, request: Request) -> CareerIntelligenceReport:
     ip = request.client.host if request.client else None
 
-    # ── Security gate ─────────────────────────────────────────────────────────
-    all_text = " ".join(profile.skills) + " " + (profile.free_text or "")
-    sec_result = validate_input(all_text, field_name="profile", source_ip=ip)
-    if not sec_result.allowed:
+    # ── Security gate (LangGraph Department 8) ────────────────────────────────
+    all_text   = " ".join(profile.skills) + " " + (profile.free_text or "")
+    sec_result = await run_security_check(
+        {"profile": all_text, "source_ip": ip or ""},
+        operation_type="input_validation",
+    )
+    if not sec_result["security_passed"]:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=sec_result.rejection_reason,
+            detail=sec_result.get("rejection_code") or "input_rejected",
         )
 
-    skills_text = sec_result.sanitised_text
+    skills_text = sec_result["scrubbed_output"].get("profile", all_text)
 
     # ── Market match via SBERT + ChromaDB ────────────────────────────────────
     match_pct, match_dist = _compute_market_match(profile.skills, profile.target_role)
@@ -179,9 +182,13 @@ async def analyse_career(profile: UserProfile, request: Request) -> CareerIntell
     # ── LLM narrative synthesis ───────────────────────────────────────────────
     narrative, action_plan = await _generate_career_narrative(profile, match_pct, skill_gaps, sector_fit, salary_exp)
 
-    # ── Output guardrails ─────────────────────────────────────────────────────
-    from marketforge.agents.security.guardrails import validate_output
-    narrative, sec_warnings = validate_output(narrative)
+    # ── Output guardrails (LangGraph security graph — output operation) ───────
+    out_check   = await run_security_check(
+        {"narrative": narrative},
+        operation_type="output_validation",
+    )
+    narrative    = out_check["scrubbed_output"].get("narrative", narrative)
+    sec_warnings = [f"pii_redacted:{t}" for t in out_check.get("pii_types_found", [])]
 
     return CareerIntelligenceReport(
         market_match_pct=round(match_pct, 1),

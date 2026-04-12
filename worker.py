@@ -20,12 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
 import uuid
-from pathlib import Path
-
-# Ensure src/ is on the path when run directly
-sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 import structlog
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -54,9 +49,9 @@ def job_ingest() -> None:
         run_store    = PipelineRunStore()
         run_store.start(run_id, "worker_ingest")
 
-        # ── Data collection ───────────────────────────────────────────────────
-        from marketforge.agents.data_collection.lead_agent import run_data_collection
-        summary = asyncio.run(run_data_collection(run_id, cost_tracker))
+        # ── Data collection (LangGraph Dept 1 pipeline) ───────────────────────
+        from marketforge.agents.graphs.data_collection import run_data_collection_pipeline
+        summary = asyncio.run(run_data_collection_pipeline(run_id=run_id))
         log.info("worker.ingest.collection_done", **summary)
 
         # ── NLP extraction ────────────────────────────────────────────────────
@@ -174,14 +169,10 @@ def job_ingest() -> None:
 
         log.info("worker.ingest.nlp_done", **nlp_stats)
 
-        # ── Market analysis ───────────────────────────────────────────────────
-        from marketforge.agents.market_analysis.lead_agent import MarketAnalystLeadAgent
-        analyst = MarketAnalystLeadAgent()
-        async def _run_analysis():
-            plan = await analyst.plan({}, {})
-            return await analyst.execute(plan, {})
-        asyncio.run(_run_analysis())
-        log.info("worker.ingest.analysis_done")
+        # ── Market analysis (LangGraph Dept 3 pipeline) ───────────────────────
+        from marketforge.agents.graphs.market_analysis import run_market_analysis_pipeline
+        analysis_summary = asyncio.run(run_market_analysis_pipeline(run_id=run_id))
+        log.info("worker.ingest.analysis_done", **analysis_summary)
 
         # ── Cache invalidation ────────────────────────────────────────────────
         try:
@@ -202,19 +193,16 @@ def job_ingest() -> None:
 
 
 def job_weekly_analysis() -> None:
-    """Generate weekly snapshot + report (no scraping)."""
+    """Generate weekly snapshot + report via LangGraph Dept 3 (no scraping)."""
     from marketforge.utils.logger import setup_logging
     setup_logging()
     run_id = f"worker_analysis_{uuid.uuid4().hex[:8]}"
     log.info("worker.analysis.start", run_id=run_id)
 
     try:
-        from marketforge.agents.market_analysis.lead_agent import MarketAnalystLeadAgent
-        analyst = MarketAnalystLeadAgent()
-        async def _run_analysis():
-            plan = await analyst.plan({}, {})
-            return await analyst.execute(plan, {})
-        asyncio.run(_run_analysis())
+        from marketforge.agents.graphs.market_analysis import run_market_analysis_pipeline
+        summary = asyncio.run(run_market_analysis_pipeline(run_id=run_id))
+        log.info("worker.analysis.pipeline_done", **summary)
 
         from marketforge.memory.redis_cache import DashboardCache
         try:
@@ -229,20 +217,16 @@ def job_weekly_analysis() -> None:
 
 
 def job_model_retrain() -> None:
-    """Retrain ML models using the latest data."""
+    """Retrain ML models via LangGraph Dept 2 (PSI drift check → retrain → registry gate)."""
     from marketforge.utils.logger import setup_logging
     setup_logging()
     run_id = f"worker_retrain_{uuid.uuid4().hex[:8]}"
     log.info("worker.retrain.start", run_id=run_id)
 
     try:
-        from marketforge.agents.ml_engineering.lead_agent import MLEngineerLeadAgent
-        lead = MLEngineerLeadAgent()
-        async def _run_retrain():
-            plan = await lead.plan({}, {})
-            return await lead.execute(plan, {})
-        asyncio.run(_run_retrain())
-        log.info("worker.retrain.done", run_id=run_id)
+        from marketforge.agents.graphs.ml_engineering import run_ml_pipeline
+        summary = asyncio.run(run_ml_pipeline(run_id=run_id))
+        log.info("worker.retrain.done", **summary)
     except Exception as exc:
         log.error("worker.retrain.failed", run_id=run_id, error=str(exc))
         raise
