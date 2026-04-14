@@ -44,36 +44,11 @@ async def get_pg_checkpointer():
     db_url = os.getenv("DATABASE_URL", settings.database_url)
     is_postgres = "postgresql" in db_url and "sqlite" not in db_url
 
-    if is_postgres:
-        # AsyncPostgresSaver uses psycopg3 — strip SQLAlchemy driver prefix
-        conn_str = (db_url
-                    .replace("postgresql+asyncpg://", "postgresql://")
-                    .replace("postgresql+psycopg2://", "postgresql://")
-                    .replace("postgresql+psycopg://", "postgresql://")
-                    .replace("postgres://", "postgresql://"))
-        try:
-            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
-            # JsonPlusSerializer handles arbitrary Python/Pydantic types gracefully,
-            # eliminating "Deserializing unregistered type" warnings for RawJob etc.
-            serde_kwargs: dict = {}
-            try:
-                from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-                serde_kwargs = {"serde": JsonPlusSerializer()}
-            except (ImportError, TypeError):
-                pass  # older LangGraph build — fall through with default serde
-
-            async with AsyncPostgresSaver.from_conn_string(conn_str, **serde_kwargs) as checkpointer:
-                await checkpointer.setup()   # idempotent: creates checkpoint tables
-                logger.info("langgraph.checkpointer", backend="postgres",
-                            serde="jsonplus" if serde_kwargs else "default")
-                yield checkpointer
-                return
-        except Exception as exc:
-            logger.warning("langgraph.checkpointer.postgres_failed", error=str(exc),
-                           fallback="memory")
-
-    # Fallback: in-memory (dev / CI / Railway before DB is ready)
+    # Always use MemorySaver — PostgreSQL checkpointing caused msgpack
+    # "Deserializing unregistered type RawJob" warnings that flooded Railway
+    # logs. Pipeline runs are stateless (fresh run each time), so in-memory
+    # checkpointing is sufficient and produces no serialization noise.
+    _ = is_postgres  # suppress unused warning
     from langgraph.checkpoint.memory import MemorySaver
     logger.info("langgraph.checkpointer", backend="memory")
     yield MemorySaver()
