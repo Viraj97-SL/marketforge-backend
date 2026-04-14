@@ -53,9 +53,20 @@ async def get_pg_checkpointer():
                     .replace("postgres://", "postgresql://"))
         try:
             from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-            async with AsyncPostgresSaver.from_conn_string(conn_str) as checkpointer:
+
+            # JsonPlusSerializer handles arbitrary Python/Pydantic types gracefully,
+            # eliminating "Deserializing unregistered type" warnings for RawJob etc.
+            serde_kwargs: dict = {}
+            try:
+                from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+                serde_kwargs = {"serde": JsonPlusSerializer()}
+            except (ImportError, TypeError):
+                pass  # older LangGraph build — fall through with default serde
+
+            async with AsyncPostgresSaver.from_conn_string(conn_str, **serde_kwargs) as checkpointer:
                 await checkpointer.setup()   # idempotent: creates checkpoint tables
-                logger.info("langgraph.checkpointer", backend="postgres")
+                logger.info("langgraph.checkpointer", backend="postgres",
+                            serde="jsonplus" if serde_kwargs else "default")
                 yield checkpointer
                 return
         except Exception as exc:
@@ -145,7 +156,12 @@ CREATE TABLE IF NOT EXISTS market.jobs (
     url                 TEXT,
     source              TEXT NOT NULL,
     posted_date         DATE,
-    scraped_at          TIMESTAMPTZ DEFAULT NOW()
+    scraped_at          TIMESTAMPTZ DEFAULT NOW(),
+    is_uk_headquartered BOOLEAN,
+    employee_count_band TEXT,
+    sponsorship_signals JSONB DEFAULT '[]',
+    flexible_hours      BOOLEAN,
+    salary_midpoint     REAL
 );
 
 -- Extracted skills (many-to-many with jobs)
@@ -192,13 +208,17 @@ CREATE TABLE IF NOT EXISTS market.weekly_snapshots (
     top_skills          JSONB DEFAULT '{}',
     rising_skills       JSONB DEFAULT '[]',
     declining_skills    JSONB DEFAULT '[]',
+    salary_p10          REAL,
     salary_p25          REAL,
     salary_p50          REAL,
     salary_p75          REAL,
+    salary_p90          REAL,
     salary_sample_size  INT DEFAULT 0,
     job_count           INT DEFAULT 0,
+    new_job_count       INT DEFAULT 0,
     sponsorship_rate    REAL DEFAULT 0,
     remote_rate         REAL DEFAULT 0,
+    hybrid_rate         REAL DEFAULT 0,
     startup_rate        REAL DEFAULT 0,
     top_cities          JSONB DEFAULT '{}',
     computed_at         TIMESTAMPTZ DEFAULT NOW(),
@@ -268,10 +288,14 @@ CREATE TABLE IF NOT EXISTS market.pipeline_runs (
     started_at      TIMESTAMPTZ NOT NULL,
     completed_at    TIMESTAMPTZ,
     status          TEXT DEFAULT 'running',
-    jobs_scraped    INT  DEFAULT 0,
-    jobs_new        INT  DEFAULT 0,
-    llm_cost_usd    REAL DEFAULT 0,
-    metadata        JSONB DEFAULT '{}'
+    jobs_scraped        INT  DEFAULT 0,
+    jobs_new            INT  DEFAULT 0,
+    jobs_deduplicated   INT  DEFAULT 0,
+    jobs_enriched       INT  DEFAULT 0,
+    llm_cost_usd        REAL DEFAULT 0,
+    sources_used        JSONB DEFAULT '[]',
+    errors              JSONB DEFAULT '[]',
+    metadata            JSONB DEFAULT '{}'
 );
 
 -- Per-sub-agent persistent state
@@ -365,17 +389,57 @@ CREATE TABLE IF NOT EXISTS market.llm_cache (
     expires_at  TIMESTAMPTZ NOT NULL
 );
 
+-- Salary percentiles by role / location / week (dedicated time-series table)
+CREATE TABLE IF NOT EXISTS market.salary_history (
+    id              BIGSERIAL PRIMARY KEY,
+    week_start      DATE NOT NULL,
+    role_category   TEXT NOT NULL DEFAULT 'all',
+    location        TEXT NOT NULL DEFAULT 'UK',
+    salary_p10      REAL,
+    salary_p25      REAL,
+    salary_p50      REAL,
+    salary_p75      REAL,
+    salary_p90      REAL,
+    salary_mean     REAL,
+    sample_size     INT DEFAULT 0,
+    computed_at     TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(week_start, role_category, location)
+);
+
+-- Per-skill demand trends over time
+CREATE TABLE IF NOT EXISTS market.skill_trends (
+    id              BIGSERIAL PRIMARY KEY,
+    week_start      DATE NOT NULL,
+    skill           TEXT NOT NULL,
+    job_count       INT DEFAULT 0,
+    pct_of_jobs     REAL DEFAULT 0,
+    role_category   TEXT NOT NULL DEFAULT 'all',
+    computed_at     TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(week_start, skill, role_category)
+);
+
 -- ── Indexes ───────────────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_jobs_dedup          ON market.jobs(dedup_hash);
 CREATE INDEX IF NOT EXISTS idx_jobs_run            ON market.jobs(run_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_scraped        ON market.jobs(scraped_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_role_cat       ON market.jobs(role_category);
+CREATE INDEX IF NOT EXISTS idx_jobs_source         ON market.jobs(source);
+CREATE INDEX IF NOT EXISTS idx_jobs_posted         ON market.jobs(posted_date);
+CREATE INDEX IF NOT EXISTS idx_jobs_experience     ON market.jobs(experience_level);
+CREATE INDEX IF NOT EXISTS idx_jobs_work_model     ON market.jobs(work_model);
 CREATE INDEX IF NOT EXISTS idx_job_skills_job      ON market.job_skills(job_id);
 CREATE INDEX IF NOT EXISTS idx_job_skills_skill    ON market.job_skills(skill);
 CREATE INDEX IF NOT EXISTS idx_snapshots_week      ON market.weekly_snapshots(week_start);
+CREATE INDEX IF NOT EXISTS idx_salary_hist_week    ON market.salary_history(week_start);
+CREATE INDEX IF NOT EXISTS idx_salary_hist_role    ON market.salary_history(role_category);
+CREATE INDEX IF NOT EXISTS idx_skill_trends_week   ON market.skill_trends(week_start);
+CREATE INDEX IF NOT EXISTS idx_skill_trends_skill  ON market.skill_trends(skill);
 CREATE INDEX IF NOT EXISTS idx_agent_state_dept    ON market.agent_state(department);
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_dag   ON market.pipeline_runs(dag_name);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_start ON market.pipeline_runs(started_at);
 CREATE INDEX IF NOT EXISTS idx_cost_log_run        ON market.cost_log(run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_logs_run      ON market.agent_logs(run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_logs_dept     ON market.agent_logs(department);
 CREATE INDEX IF NOT EXISTS idx_seen_jobs_hash      ON market.seen_jobs(dedup_hash);
 CREATE INDEX IF NOT EXISTS idx_llm_cache_expires   ON market.llm_cache(expires_at);
 """
@@ -422,21 +486,53 @@ def init_database() -> None:
         conn.commit()
 
     # ── Column migrations (safe to run on existing DBs) ───────────────────────
-    jobs_t = "jobs" if is_sqlite else "market.jobs"
+    jobs_t      = "jobs"           if is_sqlite else "market.jobs"
+    snaps_t     = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
+    runs_t      = "pipeline_runs"  if is_sqlite else "market.pipeline_runs"
+
+    _bool  = "INTEGER" if is_sqlite else "BOOLEAN"
+    _jsonb = "TEXT"    if is_sqlite else "JSONB"
+    _real  = "REAL"
+    _int   = "INT DEFAULT 0"
+    _text  = "TEXT"
+
     migrations = [
-        f"ALTER TABLE {jobs_t} ADD COLUMN IF NOT EXISTS url TEXT",
+        # market.jobs — additions
+        f"ALTER TABLE {jobs_t} ADD COLUMN IF NOT EXISTS url                 {_text}",
+        f"ALTER TABLE {jobs_t} ADD COLUMN IF NOT EXISTS is_uk_headquartered {_bool}",
+        f"ALTER TABLE {jobs_t} ADD COLUMN IF NOT EXISTS employee_count_band {_text}",
+        f"ALTER TABLE {jobs_t} ADD COLUMN IF NOT EXISTS sponsorship_signals {_jsonb} DEFAULT '[]'",
+        f"ALTER TABLE {jobs_t} ADD COLUMN IF NOT EXISTS flexible_hours      {_bool}",
+        f"ALTER TABLE {jobs_t} ADD COLUMN IF NOT EXISTS salary_midpoint     {_real}",
+        # market.weekly_snapshots — additions
+        f"ALTER TABLE {snaps_t} ADD COLUMN IF NOT EXISTS salary_p10    {_real}",
+        f"ALTER TABLE {snaps_t} ADD COLUMN IF NOT EXISTS salary_p90    {_real}",
+        f"ALTER TABLE {snaps_t} ADD COLUMN IF NOT EXISTS new_job_count {_int}",
+        f"ALTER TABLE {snaps_t} ADD COLUMN IF NOT EXISTS hybrid_rate   REAL DEFAULT 0",
+        # market.pipeline_runs — additions
+        f"ALTER TABLE {runs_t} ADD COLUMN IF NOT EXISTS jobs_deduplicated {_int}",
+        f"ALTER TABLE {runs_t} ADD COLUMN IF NOT EXISTS jobs_enriched     {_int}",
+        f"ALTER TABLE {runs_t} ADD COLUMN IF NOT EXISTS sources_used      {_jsonb} DEFAULT '[]'",
+        f"ALTER TABLE {runs_t} ADD COLUMN IF NOT EXISTS errors            {_jsonb} DEFAULT '[]'",
     ]
+
     with engine.connect() as conn:
         for stmt in migrations:
             try:
                 if is_sqlite:
-                    # SQLite doesn't support IF NOT EXISTS on ALTER TABLE
-                    # Check manually before adding
+                    # SQLite: parse column name and check existence manually
+                    # stmt format: ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <col> <type>
+                    parts   = stmt.split()
+                    tbl_raw = parts[2]
+                    col     = parts[7]   # after "IF NOT EXISTS"
                     from sqlalchemy import inspect as sa_inspect
                     insp = sa_inspect(engine)
-                    cols = [c["name"] for c in insp.get_columns(jobs_t.replace("market.", ""))]
-                    if "url" not in cols:
-                        conn.execute(text(f"ALTER TABLE {jobs_t.replace('market.', '')} ADD COLUMN url TEXT"))
+                    cols = [c["name"] for c in insp.get_columns(tbl_raw)]
+                    if col not in cols:
+                        # Build simple SQLite ALTER without IF NOT EXISTS
+                        col_idx   = stmt.index(col)
+                        col_def   = stmt[col_idx:]
+                        conn.execute(text(f"ALTER TABLE {tbl_raw} ADD COLUMN {col_def}"))
                 else:
                     conn.execute(text(stmt))
             except Exception:
@@ -596,39 +692,65 @@ class JobStore:
         self._skills_t = "job_skills"     if self._is_sqlite else "market.job_skills"
 
     def upsert_job(self, job: Any, run_id: str) -> None:
+        import json as _json
         from marketforge.models.job import RawJob
         j: RawJob = job
         now = datetime.utcnow().isoformat()
+
+        def _bool(v: Any) -> Any:
+            return int(v) if (self._is_sqlite and v is not None) else v
+
         with self._engine.connect() as conn:
             conn.execute(text(f"""
                 INSERT INTO {self._jobs_t}
                     (job_id, dedup_hash, run_id, title, description, company, location,
-                     salary_min, salary_max, work_model, experience_level,
+                     salary_min, salary_max, salary_currency, salary_midpoint,
+                     work_model, experience_level,
                      role_category, industry, company_stage, is_startup,
                      offers_sponsorship, citizens_only, degree_required,
-                     equity_offered, url, source, posted_date, scraped_at)
+                     equity_offered, flexible_hours,
+                     is_uk_headquartered, employee_count_band, sponsorship_signals,
+                     url, source, posted_date, scraped_at)
                 VALUES
                     (:job_id, :dedup_hash, :run_id, :title, :description, :company, :location,
-                     :salary_min, :salary_max, :work_model, :experience_level,
+                     :salary_min, :salary_max, :salary_currency, :salary_midpoint,
+                     :work_model, :experience_level,
                      :role_category, :industry, :company_stage, :is_startup,
                      :offers_sponsorship, :citizens_only, :degree_required,
-                     :equity_offered, :url, :source, :posted_date, :scraped_at)
+                     :equity_offered, :flexible_hours,
+                     :is_uk_headquartered, :employee_count_band, :sponsorship_signals,
+                     :url, :source, :posted_date, :scraped_at)
                 ON CONFLICT(job_id) DO NOTHING
             """), {
-                "job_id": j.job_id, "dedup_hash": j.dedup_hash, "run_id": run_id,
-                "title": j.title, "description": j.description or None, "company": j.company, "location": j.location,
-                "salary_min": j.salary_min, "salary_max": j.salary_max,
-                "work_model": j.work_model, "experience_level": j.experience_level,
-                "role_category": j.role_category, "industry": j.industry,
-                "company_stage": j.company_stage,
-                "is_startup": int(j.is_startup) if self._is_sqlite else j.is_startup,
-                "offers_sponsorship": j.offers_sponsorship,
-                "citizens_only": j.citizens_only, "degree_required": j.degree_required,
-                "equity_offered": int(j.equity_offered) if (self._is_sqlite and j.equity_offered is not None) else j.equity_offered,
-                "url": j.url or None,
-                "source": j.source,
-                "posted_date": j.posted_date.isoformat() if j.posted_date else None,
-                "scraped_at": j.scraped_at.isoformat() if j.scraped_at else now,
+                "job_id":               j.job_id,
+                "dedup_hash":           j.dedup_hash,
+                "run_id":               run_id,
+                "title":                j.title,
+                "description":          j.description or None,
+                "company":              j.company,
+                "location":             j.location,
+                "salary_min":           j.salary_min,
+                "salary_max":           j.salary_max,
+                "salary_currency":      j.salary_currency,
+                "salary_midpoint":      j.salary_midpoint,
+                "work_model":           str(j.work_model.value if hasattr(j.work_model, "value") else j.work_model),
+                "experience_level":     str(j.experience_level.value if hasattr(j.experience_level, "value") else j.experience_level) if j.experience_level else None,
+                "role_category":        str(j.role_category.value if hasattr(j.role_category, "value") else j.role_category) if j.role_category else None,
+                "industry":             j.industry,
+                "company_stage":        str(j.company_stage.value if hasattr(j.company_stage, "value") else j.company_stage),
+                "is_startup":           _bool(j.is_startup),
+                "offers_sponsorship":   j.offers_sponsorship,
+                "citizens_only":        j.citizens_only,
+                "degree_required":      str(j.degree_required),
+                "equity_offered":       _bool(j.equity_offered),
+                "flexible_hours":       _bool(j.flexible_hours),
+                "is_uk_headquartered":  _bool(j.is_uk_headquartered),
+                "employee_count_band":  j.employee_count_band,
+                "sponsorship_signals":  _json.dumps(j.sponsorship_signals) if j.sponsorship_signals else "[]",
+                "url":                  j.url or None,
+                "source":               j.source,
+                "posted_date":          j.posted_date.isoformat() if j.posted_date else None,
+                "scraped_at":           j.scraped_at.isoformat() if j.scraped_at else now,
             })
             conn.commit()
 
@@ -669,12 +791,195 @@ class PipelineRunStore:
             conn.commit()
 
     def finish(self, run_id: str, status: str, **kwargs: Any) -> None:
-        set_parts = ", ".join(f"{k} = :{k}" for k in kwargs)
-        now = datetime.utcnow().isoformat()
+        import json as _json
+        now  = datetime.utcnow().isoformat()
+        # Serialise any list/dict values to JSON for JSONB / TEXT columns
+        safe = {}
+        for k, v in kwargs.items():
+            safe[k] = _json.dumps(v) if isinstance(v, (list, dict)) else v
+        set_parts = ", ".join(f"{k} = :{k}" for k in safe)
         with self._engine.connect() as conn:
             conn.execute(text(f"""
                 UPDATE {self._table}
                 SET completed_at = :_now, status = :_status {', ' + set_parts if set_parts else ''}
                 WHERE run_id = :run_id
-            """), {"run_id": run_id, "_now": now, "_status": status, **kwargs})
+            """), {"run_id": run_id, "_now": now, "_status": status, **safe})
+            conn.commit()
+
+
+# ── SnapshotStore ─────────────────────────────────────────────────────────────
+class SnapshotStore:
+    """
+    Writes aggregated market snapshots, salary history, and skill trends.
+    Called by the Market Analysis department at the end of each weekly run.
+    """
+
+    def __init__(self) -> None:
+        self._engine    = get_sync_engine()
+        self._is_sqlite = self._engine.dialect.name == "sqlite"
+        self._snaps_t   = "weekly_snapshots" if self._is_sqlite else "market.weekly_snapshots"
+        self._salary_t  = "salary_history"   if self._is_sqlite else "market.salary_history"
+        self._trends_t  = "skill_trends"     if self._is_sqlite else "market.skill_trends"
+
+    def upsert_snapshot(self, snap: Any) -> None:
+        """Upsert a MarketSnapshot (or compatible dict) into weekly_snapshots."""
+        import json as _json
+        from marketforge.models.job import MarketSnapshot
+        s: MarketSnapshot = snap if isinstance(snap, MarketSnapshot) else MarketSnapshot(**snap)
+        now = datetime.utcnow().isoformat()
+        with self._engine.connect() as conn:
+            if self._is_sqlite:
+                conn.execute(text(f"""
+                    INSERT OR REPLACE INTO {self._snaps_t}
+                        (week_start, role_category, top_skills, rising_skills, declining_skills,
+                         salary_p10, salary_p25, salary_p50, salary_p75, salary_p90,
+                         salary_sample_size, job_count, new_job_count,
+                         sponsorship_rate, remote_rate, hybrid_rate, startup_rate,
+                         top_cities, computed_at)
+                    VALUES
+                        (:ws, :rc, :ts, :rise, :dec,
+                         :p10, :p25, :p50, :p75, :p90,
+                         :samp, :jc, :njc,
+                         :spon, :rem, :hyb, :start,
+                         :cities, :now)
+                """), {
+                    "ws":   s.week_start.isoformat(), "rc": s.role_category,
+                    "ts":   _json.dumps(s.top_skills), "rise": _json.dumps(s.rising_skills),
+                    "dec":  _json.dumps(s.declining_skills),
+                    "p10":  s.salary_p10, "p25": s.salary_p25, "p50": s.salary_p50,
+                    "p75":  s.salary_p75, "p90": s.salary_p90,
+                    "samp": s.salary_sample_size, "jc": s.job_count, "njc": s.new_job_count,
+                    "spon": s.sponsorship_rate, "rem": s.remote_rate,
+                    "hyb":  s.hybrid_rate, "start": s.startup_rate,
+                    "cities": _json.dumps(s.top_cities), "now": now,
+                })
+            else:
+                conn.execute(text(f"""
+                    INSERT INTO {self._snaps_t}
+                        (week_start, role_category, top_skills, rising_skills, declining_skills,
+                         salary_p10, salary_p25, salary_p50, salary_p75, salary_p90,
+                         salary_sample_size, job_count, new_job_count,
+                         sponsorship_rate, remote_rate, hybrid_rate, startup_rate,
+                         top_cities, computed_at)
+                    VALUES
+                        (:ws, :rc, CAST(:ts AS jsonb), CAST(:rise AS jsonb), CAST(:dec AS jsonb),
+                         :p10, :p25, :p50, :p75, :p90,
+                         :samp, :jc, :njc,
+                         :spon, :rem, :hyb, :start,
+                         CAST(:cities AS jsonb), NOW())
+                    ON CONFLICT(week_start, role_category) DO UPDATE SET
+                        top_skills        = EXCLUDED.top_skills,
+                        rising_skills     = EXCLUDED.rising_skills,
+                        declining_skills  = EXCLUDED.declining_skills,
+                        salary_p10        = EXCLUDED.salary_p10,
+                        salary_p25        = EXCLUDED.salary_p25,
+                        salary_p50        = EXCLUDED.salary_p50,
+                        salary_p75        = EXCLUDED.salary_p75,
+                        salary_p90        = EXCLUDED.salary_p90,
+                        salary_sample_size= EXCLUDED.salary_sample_size,
+                        job_count         = EXCLUDED.job_count,
+                        new_job_count     = EXCLUDED.new_job_count,
+                        sponsorship_rate  = EXCLUDED.sponsorship_rate,
+                        remote_rate       = EXCLUDED.remote_rate,
+                        hybrid_rate       = EXCLUDED.hybrid_rate,
+                        startup_rate      = EXCLUDED.startup_rate,
+                        top_cities        = EXCLUDED.top_cities,
+                        computed_at       = NOW()
+                """), {
+                    "ws":   s.week_start.isoformat(), "rc": s.role_category,
+                    "ts":   _json.dumps(s.top_skills), "rise": _json.dumps(s.rising_skills),
+                    "dec":  _json.dumps(s.declining_skills),
+                    "p10":  s.salary_p10, "p25": s.salary_p25, "p50": s.salary_p50,
+                    "p75":  s.salary_p75, "p90": s.salary_p90,
+                    "samp": s.salary_sample_size, "jc": s.job_count, "njc": s.new_job_count,
+                    "spon": s.sponsorship_rate, "rem": s.remote_rate,
+                    "hyb":  s.hybrid_rate, "start": s.startup_rate,
+                    "cities": _json.dumps(s.top_cities),
+                })
+            conn.commit()
+
+    def upsert_salary_history(
+        self,
+        week_start: Any,
+        role_category: str,
+        location: str,
+        *,
+        p10: float | None = None,
+        p25: float | None = None,
+        p50: float | None = None,
+        p75: float | None = None,
+        p90: float | None = None,
+        mean: float | None = None,
+        sample_size: int = 0,
+    ) -> None:
+        ws = week_start.isoformat() if hasattr(week_start, "isoformat") else str(week_start)
+        with self._engine.connect() as conn:
+            if self._is_sqlite:
+                conn.execute(text(f"""
+                    INSERT OR REPLACE INTO {self._salary_t}
+                        (week_start, role_category, location,
+                         salary_p10, salary_p25, salary_p50, salary_p75, salary_p90,
+                         salary_mean, sample_size)
+                    VALUES (:ws, :rc, :loc, :p10, :p25, :p50, :p75, :p90, :mean, :samp)
+                """), {
+                    "ws": ws, "rc": role_category, "loc": location,
+                    "p10": p10, "p25": p25, "p50": p50, "p75": p75, "p90": p90,
+                    "mean": mean, "samp": sample_size,
+                })
+            else:
+                conn.execute(text(f"""
+                    INSERT INTO {self._salary_t}
+                        (week_start, role_category, location,
+                         salary_p10, salary_p25, salary_p50, salary_p75, salary_p90,
+                         salary_mean, sample_size)
+                    VALUES (:ws, :rc, :loc, :p10, :p25, :p50, :p75, :p90, :mean, :samp)
+                    ON CONFLICT(week_start, role_category, location) DO UPDATE SET
+                        salary_p10  = EXCLUDED.salary_p10,
+                        salary_p25  = EXCLUDED.salary_p25,
+                        salary_p50  = EXCLUDED.salary_p50,
+                        salary_p75  = EXCLUDED.salary_p75,
+                        salary_p90  = EXCLUDED.salary_p90,
+                        salary_mean = EXCLUDED.salary_mean,
+                        sample_size = EXCLUDED.sample_size,
+                        computed_at = NOW()
+                """), {
+                    "ws": ws, "rc": role_category, "loc": location,
+                    "p10": p10, "p25": p25, "p50": p50, "p75": p75, "p90": p90,
+                    "mean": mean, "samp": sample_size,
+                })
+            conn.commit()
+
+    def upsert_skill_trends(
+        self,
+        week_start: Any,
+        skill_counts: dict[str, int],
+        total_jobs: int,
+        role_category: str = "all",
+    ) -> None:
+        """
+        skill_counts: {skill: job_count}
+        total_jobs: denominator for pct_of_jobs
+        """
+        if not skill_counts or total_jobs == 0:
+            return
+        ws = week_start.isoformat() if hasattr(week_start, "isoformat") else str(week_start)
+        with self._engine.connect() as conn:
+            for skill, count in skill_counts.items():
+                pct = round(count / total_jobs, 6)
+                if self._is_sqlite:
+                    conn.execute(text(f"""
+                        INSERT OR REPLACE INTO {self._trends_t}
+                            (week_start, skill, job_count, pct_of_jobs, role_category)
+                        VALUES (:ws, :sk, :cnt, :pct, :rc)
+                    """), {"ws": ws, "sk": skill, "cnt": count, "pct": pct, "rc": role_category})
+                else:
+                    conn.execute(text(f"""
+                        INSERT INTO {self._trends_t}
+                            (week_start, skill, job_count, pct_of_jobs, role_category)
+                        VALUES (:ws, :sk, :cnt, :pct, :rc)
+                        ON CONFLICT(week_start, skill, role_category) DO UPDATE SET
+                            job_count   = EXCLUDED.job_count,
+                            pct_of_jobs = EXCLUDED.pct_of_jobs,
+                            computed_at = NOW()
+                    """), {"ws": ws, "sk": skill, "cnt": count, "pct": pct, "rc": role_category})
             conn.commit()
