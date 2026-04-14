@@ -120,60 +120,101 @@ async def compile_snapshot(state: MarketAnalysisState) -> dict:
     geo_dist         = state.get("geo_distribution", {})
     archetypes       = state.get("tech_archetypes",  [])
 
+    # job_count: sum role_velocity values (velocity node returns role→count dict,
+    # not a "total_jobs_this_week" key — fix for snapshot always showing 0)
+    role_velocity = velocity_data.get("role_velocity", {})
+    job_count     = sum(role_velocity.values()) if role_velocity else 0
+
+    # hybrid_rate: geo_dist may expose it directly or via city_breakdown
+    hybrid_rate = geo_dist.get("hybrid_rate", 0.0)
+
     snapshot: dict[str, Any] = {
-        "week_start":        week,
-        "job_count":         velocity_data.get("total_jobs_this_week", 0),
-        "top_skills":        skill_trends.get("top_skills", {}),
-        "rising_skills":     skill_trends.get("rising_skills", []),
-        "declining_skills":  skill_trends.get("declining_skills", []),
-        "salary_p10":        salary_stats.get("p10"),
-        "salary_p25":        salary_stats.get("p25"),
-        "salary_p50":        salary_stats.get("p50"),
-        "salary_p75":        salary_stats.get("p75"),
-        "salary_p90":        salary_stats.get("p90"),
+        "week_start":         week,
+        "job_count":          job_count,
+        "top_skills":         skill_trends.get("top_skills", {}),
+        "rising_skills":      skill_trends.get("rising_skills", []),
+        "declining_skills":   skill_trends.get("declining_skills", []),
+        "salary_p10":         salary_stats.get("p10"),
+        "salary_p25":         salary_stats.get("p25"),
+        "salary_p50":         salary_stats.get("p50"),
+        "salary_p75":         salary_stats.get("p75"),
+        "salary_p90":         salary_stats.get("p90"),
         "salary_sample_size": salary_stats.get("sample_size", 0),
-        "sponsorship_rate":  sponsorship_data.get("sponsorship_rate", 0),
-        "remote_rate":       geo_dist.get("remote_rate", 0),
-        "geo_breakdown":     geo_dist.get("city_breakdown", {}),
-        "tech_archetypes":   archetypes,
-        "generated_at":      datetime.utcnow().isoformat(),
+        "sponsorship_rate":   sponsorship_data.get("sponsorship_rate", 0),
+        "remote_rate":        geo_dist.get("remote_rate", 0),
+        "hybrid_rate":        hybrid_rate,
+        "startup_rate":       sponsorship_data.get("startup_rate", 0),
+        "top_cities":         geo_dist.get("city_breakdown", {}),
+        "geo_breakdown":      geo_dist.get("city_breakdown", {}),
+        "tech_archetypes":    archetypes,
+        "generated_at":       datetime.utcnow().isoformat(),
     }
 
-    # Persist to market.weekly_snapshots
+    # Persist to market.weekly_snapshots — save ALL fields so API never returns nulls
     try:
         engine   = get_sync_engine()
-        snaps_t  = "weekly_snapshots" if engine.dialect.name == "sqlite" else "market.weekly_snapshots"
-        top_json = json.dumps(snapshot.get("top_skills", {}))
+        is_sq    = engine.dialect.name == "sqlite"
+        snaps_t  = "weekly_snapshots" if is_sq else "market.weekly_snapshots"
+
+        def _j(v: Any) -> str:
+            return json.dumps(v) if v is not None else "[]"
+
+        cast = "" if is_sq else "::jsonb"
 
         with engine.connect() as conn:
             conn.execute(text(f"""
                 INSERT INTO {snaps_t}
-                    (week_start, role_category, job_count, top_skills,
-                     salary_p25, salary_p50, salary_p75, salary_sample_size,
-                     sponsorship_rate, remote_rate)
-                VALUES (:ws, 'all', :jc, :ts, :p25, :p50, :p75, :sn, :sr, :rr)
+                    (week_start, role_category, job_count,
+                     top_skills, rising_skills, declining_skills, top_cities,
+                     salary_p10, salary_p25, salary_p50, salary_p75, salary_p90,
+                     salary_sample_size,
+                     sponsorship_rate, remote_rate, hybrid_rate, startup_rate,
+                     computed_at)
+                VALUES
+                    (:ws, 'all', :jc,
+                     CAST(:ts AS TEXT){cast}, CAST(:rise AS TEXT){cast},
+                     CAST(:dec AS TEXT){cast}, CAST(:cities AS TEXT){cast},
+                     :p10, :p25, :p50, :p75, :p90,
+                     :sn,
+                     :sr, :rr, :hr, :str,
+                     NOW())
                 ON CONFLICT (week_start, role_category) DO UPDATE SET
-                    job_count        = EXCLUDED.job_count,
-                    top_skills       = EXCLUDED.top_skills,
-                    salary_p25       = EXCLUDED.salary_p25,
-                    salary_p50       = EXCLUDED.salary_p50,
-                    salary_p75       = EXCLUDED.salary_p75,
+                    job_count          = EXCLUDED.job_count,
+                    top_skills         = EXCLUDED.top_skills,
+                    rising_skills      = EXCLUDED.rising_skills,
+                    declining_skills   = EXCLUDED.declining_skills,
+                    top_cities         = EXCLUDED.top_cities,
+                    salary_p10         = EXCLUDED.salary_p10,
+                    salary_p25         = EXCLUDED.salary_p25,
+                    salary_p50         = EXCLUDED.salary_p50,
+                    salary_p75         = EXCLUDED.salary_p75,
+                    salary_p90         = EXCLUDED.salary_p90,
                     salary_sample_size = EXCLUDED.salary_sample_size,
-                    sponsorship_rate = EXCLUDED.sponsorship_rate,
-                    remote_rate      = EXCLUDED.remote_rate
+                    sponsorship_rate   = EXCLUDED.sponsorship_rate,
+                    remote_rate        = EXCLUDED.remote_rate,
+                    hybrid_rate        = EXCLUDED.hybrid_rate,
+                    startup_rate       = EXCLUDED.startup_rate,
+                    computed_at        = NOW()
             """), {
-                "ws":  week,
-                "jc":  snapshot["job_count"],
-                "ts":  top_json,
-                "p25": snapshot.get("salary_p25"),
-                "p50": snapshot.get("salary_p50"),
-                "p75": snapshot.get("salary_p75"),
-                "sn":  snapshot.get("salary_sample_size", 0),
-                "sr":  snapshot.get("sponsorship_rate", 0),
-                "rr":  snapshot.get("remote_rate", 0),
+                "ws":    week,
+                "jc":    job_count,
+                "ts":    _j(snapshot["top_skills"]),
+                "rise":  _j(snapshot["rising_skills"]),
+                "dec":   _j(snapshot["declining_skills"]),
+                "cities": _j(snapshot["top_cities"]),
+                "p10":   snapshot.get("salary_p10"),
+                "p25":   snapshot.get("salary_p25"),
+                "p50":   snapshot.get("salary_p50"),
+                "p75":   snapshot.get("salary_p75"),
+                "p90":   snapshot.get("salary_p90"),
+                "sn":    snapshot.get("salary_sample_size", 0),
+                "sr":    snapshot.get("sponsorship_rate", 0),
+                "rr":    snapshot.get("remote_rate", 0),
+                "hr":    hybrid_rate,
+                "str":   snapshot.get("startup_rate", 0),
             })
             conn.commit()
-        logger.info("market_analysis.snapshot.saved", week=week, jobs=snapshot["job_count"])
+        logger.info("market_analysis.snapshot.saved", week=week, jobs=job_count)
     except Exception as exc:
         logger.error("market_analysis.snapshot.save_failed", error=str(exc))
 
