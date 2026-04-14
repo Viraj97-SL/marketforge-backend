@@ -1,18 +1,48 @@
-.env
-.env.*
-*.pyc
+# Python
 __pycache__/
-.venv/
-venv/
-*.db
-*.sqlite
-data/
-outputs/
-mlflow/
-.pytest_cache/
-.coverage
+*.py[cod]
+*.egg-info/
 dist/
 build/
-*.egg-info/
-.idea/
+.eggs/
+*.egg
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
 .vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+*.db
+
+# Data and outputs (never commit scraped data)
+data/chroma_db/
+data/*.db
+outputs/
+
+# Airflow
+airflow/logs/
+airflow/plugins/*.pyc
+
+# MLflow artifacts
+mlflow/artifacts/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Mypy
+.mypy_cache/
+
+# LangGraph local dev server state (binary checkpoints, never commit)
+.langgraph_api/

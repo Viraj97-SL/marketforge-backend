@@ -1,34 +1,27 @@
-# MarketForge AI Backend — Railway Multi-Service Config
-# Deploy this repo to Railway. Create TWO services from the same repo:
-#   1. "api"    → runs the FastAPI server
-#   2. "worker" → runs the APScheduler pipeline worker
-# Each service overrides startCommand in its Railway dashboard settings.
+# MarketForge AI — Railway Deployment Config
+# Each service is deployed as a separate Railway service.
 
+# ── FastAPI (web service) ──────────────────────────────────────────────────────
 [build]
 builder = "dockerfile"
-dockerfilePath = "Dockerfile"
-
-# ── Service: API ──────────────────────────────────────────────────────────────
-# startCommand (set in Railway dashboard for "api" service):
-#   uvicorn api.main:app --host 0.0.0.0 --port $PORT
 
 [deploy]
+startCommand = "uvicorn api.main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/api/v1/health"
-healthcheckTimeout = 30
+healthcheckTimeout = 120
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
 
-# ── Service: Worker ───────────────────────────────────────────────────────────
-# For the worker service, override startCommand in Railway dashboard to:
-#   python worker.py
-
-# ── Environment Variables (set in Railway dashboard — never commit) ──────────
-# DATABASE_URL          — auto-injected by Railway PostgreSQL addon
-# REDIS_URL             — auto-injected by Railway Redis addon
+# Environment variables set in Railway dashboard (never commit):
+# DATABASE_URL          — auto-set by Railway PostgreSQL addon
+# DATABASE_URL_SYNC     — REQUIRED: same host/db as DATABASE_URL but use
+#                         postgresql+psycopg2:// prefix (Railway does not set this
+#                         automatically; derive it from DATABASE_URL and set manually)
+# REDIS_URL             — auto-set by Railway Redis addon
 # GEMINI_API_KEY        — Google AI Studio
 # LANGCHAIN_API_KEY     — LangSmith
 # LANGCHAIN_TRACING_V2  — true
-# LANGCHAIN_PROJECT     — marketforge-backend
+# LANGCHAIN_PROJECT     — marketforge-ai
 # ADZUNA_APP_ID         — Adzuna developer portal
 # ADZUNA_APP_KEY        — Adzuna developer portal
 # REED_API_KEY          — Reed developer portal
@@ -41,3 +34,4 @@ restartPolicyMaxRetries = 5
 # ENVIRONMENT           — production
 # LOG_LEVEL             — INFO
 # LOG_FORMAT            — json
+# MLFLOW_TRACKING_URI   — http://mlflow-service.railway.internal:5001
