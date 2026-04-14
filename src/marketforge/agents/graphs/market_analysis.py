@@ -125,8 +125,30 @@ async def compile_snapshot(state: MarketAnalysisState) -> dict:
     role_velocity = velocity_data.get("role_velocity", {})
     job_count     = sum(role_velocity.values()) if role_velocity else 0
 
+    # Final safety-net: if the velocity agent still returned nothing (e.g. all
+    # role_category values are NULL), do a direct count from the jobs table so
+    # the dashboard never shows "—" when jobs genuinely exist in the DB.
+    if job_count == 0:
+        try:
+            from datetime import timedelta
+            engine_tmp  = get_sync_engine()
+            is_sq_tmp   = engine_tmp.dialect.name == "sqlite"
+            jobs_tbl    = "jobs" if is_sq_tmp else "market.jobs"
+            thirty_ago  = str(date.fromisoformat(week) - timedelta(days=30))
+            with engine_tmp.connect() as conn_tmp:
+                job_count = conn_tmp.execute(text(
+                    f"SELECT COUNT(*) FROM {jobs_tbl} WHERE scraped_at >= :since"
+                ), {"since": thirty_ago}).scalar() or 0
+        except Exception:
+            pass
+
     # hybrid_rate: geo_dist may expose it directly or via city_breakdown
     hybrid_rate = geo_dist.get("hybrid_rate", 0.0)
+
+    # SalaryIntelligenceAgent.output() returns keys with the "salary_" prefix
+    # (e.g. "salary_p50"). Accept both forms so this never silently returns null.
+    def _sal(key: str):
+        return salary_stats.get(f"salary_{key}") or salary_stats.get(key)
 
     snapshot: dict[str, Any] = {
         "week_start":         week,
@@ -134,11 +156,11 @@ async def compile_snapshot(state: MarketAnalysisState) -> dict:
         "top_skills":         skill_trends.get("top_skills", {}),
         "rising_skills":      skill_trends.get("rising_skills", []),
         "declining_skills":   skill_trends.get("declining_skills", []),
-        "salary_p10":         salary_stats.get("p10"),
-        "salary_p25":         salary_stats.get("p25"),
-        "salary_p50":         salary_stats.get("p50"),
-        "salary_p75":         salary_stats.get("p75"),
-        "salary_p90":         salary_stats.get("p90"),
+        "salary_p10":         _sal("p10"),
+        "salary_p25":         _sal("p25"),
+        "salary_p50":         _sal("p50"),
+        "salary_p75":         _sal("p75"),
+        "salary_p90":         _sal("p90"),
         "salary_sample_size": salary_stats.get("sample_size", 0),
         "sponsorship_rate":   sponsorship_data.get("sponsorship_rate", 0),
         "remote_rate":        geo_dist.get("remote_rate", 0),
