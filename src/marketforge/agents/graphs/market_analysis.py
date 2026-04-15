@@ -125,9 +125,7 @@ async def compile_snapshot(state: MarketAnalysisState) -> dict:
     role_velocity = velocity_data.get("role_velocity", {})
     job_count     = sum(role_velocity.values()) if role_velocity else 0
 
-    # Final safety-net: if the velocity agent still returned nothing (e.g. all
-    # role_category values are NULL), do a direct count from the jobs table so
-    # the dashboard never shows "—" when jobs genuinely exist in the DB.
+    # Safety-net: if velocity returned nothing, count jobs directly (last 30d)
     if job_count == 0:
         try:
             from datetime import timedelta

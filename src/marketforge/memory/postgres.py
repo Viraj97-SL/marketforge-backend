@@ -695,7 +695,10 @@ class JobStore:
                      :equity_offered, :flexible_hours,
                      :is_uk_headquartered, :employee_count_band, :sponsorship_signals,
                      :url, :source, :posted_date, :scraped_at)
-                ON CONFLICT(job_id) DO NOTHING
+                ON CONFLICT(job_id) DO UPDATE SET
+                    scraped_at = EXCLUDED.scraped_at,
+                    run_id     = EXCLUDED.run_id,
+                    dedup_hash = EXCLUDED.dedup_hash
             """), {
                 "job_id":               j.job_id,
                 "dedup_hash":           j.dedup_hash,
@@ -728,6 +731,28 @@ class JobStore:
                 "scraped_at":           j.scraped_at.isoformat() if j.scraped_at else now,
             })
             conn.commit()
+
+    def touch_scraped_at(self, job_ids: list[str]) -> int:
+        """Refresh scraped_at to NOW() for all job_ids already in the DB (re-seen jobs).
+        Returns the count of rows updated."""
+        if not job_ids:
+            return 0
+        now = datetime.utcnow().isoformat()
+        with self._engine.connect() as conn:
+            if self._is_sqlite:
+                from sqlalchemy import bindparam
+                result = conn.execute(
+                    text(f"UPDATE {self._jobs_t} SET scraped_at = :now WHERE job_id IN :ids")
+                    .bindparams(bindparam("ids", expanding=True)),
+                    {"now": now, "ids": job_ids},
+                )
+            else:
+                result = conn.execute(
+                    text(f"UPDATE {self._jobs_t} SET scraped_at = NOW() WHERE job_id = ANY(:ids)"),
+                    {"ids": job_ids},
+                )
+            conn.commit()
+        return result.rowcount
 
     def upsert_skills(self, job_id: str, skills: list[tuple[str, str, str, float]]) -> None:
         """skills: list of (skill, category, method, confidence)"""

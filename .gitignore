@@ -46,3 +46,6 @@ Thumbs.db
 
 # LangGraph local dev server state (binary checkpoints, never commit)
 .langgraph_api/
+
+# Claude Code private context — never commit or deploy
+CLAUDE.md

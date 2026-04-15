@@ -47,3 +47,6 @@ Thumbs.db
 # Secrets
 .env
 *.env
+
+# Claude Code private context — never deploy
+CLAUDE.md
