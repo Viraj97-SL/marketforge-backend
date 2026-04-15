@@ -7,6 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Ensure local src/ takes precedence over pip-installed marketforge-ai package
+ENV PYTHONPATH=/app/src
+
 # Copy deps first for layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
