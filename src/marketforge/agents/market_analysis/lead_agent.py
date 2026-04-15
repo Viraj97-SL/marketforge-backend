@@ -228,8 +228,12 @@ class SalaryIntelligenceAgent(DeepAgent):
         from sqlalchemy import text
         week = plan["week_start"]
         engine = _engine()
-        # Try current week first; fall back to 30-day window if fewer than 5 salary rows
-        windows = [week, str(date.fromisoformat(week) - timedelta(days=30))]
+        # Try current week → 30 days → 90 days until we have ≥5 salary rows
+        windows = [
+            week,
+            str(date.fromisoformat(week) - timedelta(days=30)),
+            str(date.fromisoformat(week) - timedelta(days=90)),
+        ]
 
         rows = []
         total_jobs = 1
@@ -990,13 +994,28 @@ class MarketAnalystLeadAgent(DeepAgent):
         cooc_out         = _safe(cooc_out,        {})
         fingerprint_out  = _safe(fingerprint_out, {})
 
-        # Count actual jobs for this week
+        # job_count: use velocity agent's role_velocity sum (already has 30-day fallback).
+        # If still 0, fall back to direct COUNT with 30-day window, then 90-day, then all-time.
+        # This ensures the dashboard never shows 0 just because the scraper ran before week_start.
         from sqlalchemy import text as _text
-        with _engine().connect() as _conn:
-            actual_job_count = _conn.execute(
-                _text(f"SELECT COUNT(*) FROM {_t('jobs')} WHERE scraped_at >= :w"),
-                {"w": week},
-            ).scalar() or 0
+        role_velocity = velocity_out.get("role_velocity", {})
+        actual_job_count = sum(role_velocity.values()) if role_velocity else 0
+
+        if actual_job_count == 0:
+            for days_back in (30, 90, None):
+                with _engine().connect() as _conn:
+                    if days_back is not None:
+                        since = str(date.fromisoformat(week) - timedelta(days=days_back))
+                        actual_job_count = _conn.execute(
+                            _text(f"SELECT COUNT(*) FROM {_t('jobs')} WHERE scraped_at >= :w"),
+                            {"w": since},
+                        ).scalar() or 0
+                    else:
+                        actual_job_count = _conn.execute(
+                            _text(f"SELECT COUNT(*) FROM {_t('jobs')}"),
+                        ).scalar() or 0
+                if actual_job_count > 0:
+                    break
 
         # Merge into one snapshot dict
         snapshot = {
