@@ -27,4 +27,4 @@ RUN pip install --no-cache-dir -e .
 RUN python scripts/bootstrap.py || echo "[WARN] Bootstrap deferred to first start"
 
 # Shell form so Railway's $PORT env var is expanded at runtime
-CMD ["/bin/sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["/bin/sh", "-c", "gunicorn api.main:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-8000} --timeout 120 --graceful-timeout 30"]
