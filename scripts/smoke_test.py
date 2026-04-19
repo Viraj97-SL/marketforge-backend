@@ -413,6 +413,15 @@ def check_api() -> None:
             R.check("Health response has jobs_total field",  "jobs_total" in data)
             R.check("jobs_total ≥ 0",                        data.get("jobs_total", -1) >= 0)
 
+            R.check("X-Content-Type-Options header present",
+                    resp.headers.get("X-Content-Type-Options") == "nosniff")
+            R.check("X-Frame-Options header present",
+                    resp.headers.get("X-Frame-Options") == "DENY")
+            R.check("Content-Security-Policy header present",
+                    "Content-Security-Policy" in resp.headers)
+            R.check("Strict-Transport-Security header present",
+                    "Strict-Transport-Security" in resp.headers)
+
     except Exception:
         R.fail("FastAPI /health", traceback.format_exc(limit=3))
 

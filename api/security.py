@@ -46,16 +46,9 @@ def _check_rate_limit(ip: str, limit: int, window_seconds: int) -> bool:
         return True
 
 
-# ── Per-endpoint rate limit config ───────────────────────────────────────────
-
-_RATE_LIMITS: dict[str, tuple[int, int]] = {
-    "/api/v1/career/analyse": (10,  60),     # 10 req/min (LLM-backed)
-    "/api/v1/market/skills":  (100, 60),     # 100 req/min (cached)
-    "/api/v1/market/salary":  (100, 60),
-    "/api/v1/market/snapshot":(100, 60),
-    "/api/v1/market/trending":(100, 60),
-    "/api/v1/health":         (200, 60),
-}
+# Rate limiting is handled by rate_limit_middleware in main.py (per-endpoint keys).
+# SecurityMiddleware focuses on headers, logging, and exception handling only.
+_RATE_LIMITS: dict[str, tuple[int, int]] = {}
 
 # Endpoints that run the security validation pipeline
 _SECURITY_VALIDATED_PATHS = {"/api/v1/career/analyse"}
@@ -116,6 +109,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"]           = "DENY"
         response.headers["X-XSS-Protection"]          = "1; mode=block"
         response.headers["Referrer-Policy"]           = "strict-origin-when-cross-origin"
+        response.headers["Content-Security-Policy"]   = "default-src 'none'; frame-ancestors 'none'"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Permissions-Policy"]        = "geolocation=(), microphone=(), camera=()"
         response.headers["X-Response-Time-Ms"]        = str(duration_ms)
         response.headers["Cache-Control"]             = "no-store" if path in _SECURITY_VALIDATED_PATHS else "public, max-age=300"
 
@@ -126,10 +122,11 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 
     @staticmethod
     def _get_client_ip(request: Request) -> str:
-        """Extract real client IP, respecting X-Forwarded-For (Railway/Cloudflare proxy)."""
+        """Extract real client IP. Railway appends the real client IP as the rightmost XFF entry."""
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
-            return forwarded.split(",")[0].strip()
+            parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+            return parts[-1] if parts else "unknown"
         return request.client.host if request.client else "unknown"
 
 
@@ -141,20 +138,13 @@ async def validate_career_input(
 ) -> tuple[bool, dict, str | None]:
     """
     Dependency used by the career advisor endpoint.
-    Runs the full LangGraph Department 8 security pipeline on user input.
+    Runs the full SecurityLeadAgent pipeline on user input.
     Returns (accepted, sanitised_input, rejection_reason).
     """
     client_ip = SecurityMiddleware._get_client_ip(request)
     try:
-        from marketforge.agents.graphs.security import run_security_check
-        result = await run_security_check(
-            {**raw_input, "source_ip": client_ip},
-            operation_type="input_validation",
-        )
-        accepted        = result["security_passed"]
-        sanitised       = result.get("scrubbed_output", raw_input)
-        rejection       = result.get("rejection_code") or None
-        return accepted, sanitised, rejection
+        from marketforge.agents.security.lead_agent import validate_user_input
+        return await validate_user_input(raw_input, source_ip=client_ip)
     except Exception as exc:
         logger.error("security.validate_career_input.failed", error=str(exc))
         # Fail closed — reject on error rather than passing unsafe input
@@ -179,15 +169,12 @@ def require_clean_input(accepted: bool, rejection_reason: str | None) -> None:
 
 async def sanitise_output(text: str) -> tuple[str, list[str]]:
     """
-    Run output guardrails via LangGraph Department 8 before serving.
+    Run output guardrails (PII scrub, salary sanity check) before serving.
     Returns (sanitised_text, warnings).
     """
     try:
-        from marketforge.agents.graphs.security import run_security_check
-        result   = await run_security_check({"output": text}, operation_type="output_validation")
-        cleaned  = result.get("scrubbed_output", {}).get("output", text)
-        warnings = [f"pii_redacted:{t}" for t in result.get("pii_types_found", [])]
-        return cleaned, warnings
+        from marketforge.agents.security.guardrails import validate_output
+        return validate_output(text)
     except Exception as exc:
         logger.warning("security.sanitise_output.failed", error=str(exc))
         return text, []
