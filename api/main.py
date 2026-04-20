@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
 import structlog
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
@@ -183,7 +183,8 @@ class HealthResponse(BaseModel):
     summary="Personalised career gap analysis",
     description="Analyses your profile against current market data. No data is persisted.",
 )
-async def analyse_career(profile: UserProfile, request: Request) -> CareerIntelligenceReport:
+async def analyse_career(profile: UserProfile, request: Request, fastapi_response: Response) -> CareerIntelligenceReport:
+    fastapi_response.headers["Access-Control-Allow-Origin"] = "*"
     ip = _get_client_ip(request)
 
     # ── Security gate ─────────────────────────────────────────────────────────
@@ -803,6 +804,19 @@ class CVAnalysisReport(BaseModel):
     data_retained:     bool = False     # always False — GDPR guarantee
 
 
+@app.options("/api/v1/career/cv-analyse")
+@app.options("/api/v1/career/analyse")
+async def career_cors_preflight():
+    return Response(
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Max-Age": "3600",
+        }
+    )
+
+
 @app.post(
     "/api/v1/career/cv-analyse",
     response_model=CVAnalysisReport,
@@ -815,6 +829,7 @@ class CVAnalysisReport(BaseModel):
 )
 async def analyse_cv(
     request:     Request,
+    fastapi_response: Response,
     cv_file:     UploadFile = File(..., description="PDF or DOCX CV, max 5 MB"),
     target_role: str        = "ml_engineer",
     consent:     bool       = False,
@@ -907,6 +922,10 @@ async def analyse_cv(
         ats_grade=ats.grade,
         ml_gaps_total=len(ml_gaps.all_gaps),
     )
+
+    fastapi_response.headers["Access-Control-Allow-Origin"] = "*"
+    fastapi_response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    fastapi_response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
 
     return CVAnalysisReport(
         session_token     = gdpr_ctx.session_token,
