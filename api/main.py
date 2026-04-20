@@ -81,7 +81,14 @@ app = FastAPI(
 
 _ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["*"]
 
-app.add_middleware(SecurityMiddleware)
+# CORSMiddleware must be registered BEFORE SecurityMiddleware so it becomes the
+# inner layer in the ASGI stack. FastAPI applies middleware LIFO, so the last
+# add_middleware call becomes outermost. SecurityMiddleware uses BaseHTTPMiddleware
+# which reconstructs the ASGI response and breaks CORSMiddleware's header injection
+# when SecurityMiddleware is the inner layer.
+#
+# Correct ASGI stack (request path):
+#   SecurityMiddleware (outer) → CORSMiddleware (inner) → route handlers
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
@@ -89,6 +96,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
     allow_credentials=False,
 )
+app.add_middleware(SecurityMiddleware)
 
 
 # ── IP extraction utility ─────────────────────────────────────────────────────
