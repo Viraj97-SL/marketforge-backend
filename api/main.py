@@ -56,6 +56,13 @@ def _get_sbert():
 async def lifespan(app: FastAPI):
     setup_logging()
     init_database()
+    # Pre-warm SBERT so both gunicorn workers have the model loaded before
+    # handling requests — prevents 30s+ cold-start on the first CV analysis.
+    try:
+        await asyncio.to_thread(_get_sbert)
+        logger.info("sbert.warmed")
+    except Exception as exc:
+        logger.warning("sbert.warm_failed", error=str(exc))
     logger.info("api.startup", version="0.1.0", env=settings.environment)
     yield
     logger.info("api.shutdown")
