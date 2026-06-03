@@ -559,8 +559,8 @@ async def get_top_skills(
 @app.get("/api/v1/market/salary", summary="Salary benchmarks")
 async def get_salary_benchmark(
     role_category:    str = Query(default="all"),
-    experience_level: str = Query(default="mid"),
-    location:         str = Query(default="London"),
+    experience_level: str = Query(default="all"),
+    location:         str = Query(default="all"),
 ) -> dict:
     cache_key = f"salary:{role_category}:{experience_level}:{location}"
     cached    = cache.get(cache_key)
@@ -571,22 +571,112 @@ async def get_salary_benchmark(
     from sqlalchemy import text
     engine    = get_sync_engine()
     is_sqlite = engine.dialect.name == "sqlite"
-    table     = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
 
-    with engine.connect() as conn:
-        row = conn.execute(text(f"""
-            SELECT salary_p25, salary_p50, salary_p75, salary_sample_size, week_start
-            FROM {table}
-            WHERE role_category = :rc
-            ORDER BY week_start DESC LIMIT 1
-        """), {"rc": role_category}).mappings().fetchone()
+    # Fast path: use precomputed snapshot when no experience/location filter
+    if experience_level in ("all", "") and location in ("all", ""):
+        table = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
+        with engine.connect() as conn:
+            row = conn.execute(text(f"""
+                SELECT salary_p25, salary_p50, salary_p75, salary_sample_size, week_start
+                FROM {table}
+                WHERE role_category = :rc
+                ORDER BY week_start DESC LIMIT 1
+            """), {"rc": role_category}).mappings().fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="No salary data available")
+        result = dict(row)
+    else:
+        result = _compute_salary_from_jobs(engine, is_sqlite, role_category, experience_level, location)
+        if not result:
+            raise HTTPException(status_code=404, detail="No salary data available")
 
-    if not row:
-        raise HTTPException(status_code=404, detail="No salary data available")
-
-    result = dict(row)
     cache.set(cache_key, result)
     return result
+
+
+def _compute_salary_from_jobs(
+    engine,
+    is_sqlite: bool,
+    role_category: str,
+    experience_level: str,
+    location: str,
+) -> dict | None:
+    from sqlalchemy import text
+    from datetime import date
+
+    table = "jobs" if is_sqlite else "market.jobs"
+    conditions = ["salary_min IS NOT NULL"]
+    params: dict = {}
+
+    if role_category and role_category != "all":
+        conditions.append("role_category = :rc")
+        params["rc"] = role_category
+
+    if experience_level and experience_level not in ("all", ""):
+        _EXP_MAP: dict[str, tuple] = {
+            "junior":    ("junior",),
+            "mid":       ("mid", "mid-level"),
+            "senior":    ("senior",),
+            "principal": ("lead", "principal", "staff"),
+            "lead":      ("lead", "principal", "staff"),
+        }
+        levels = _EXP_MAP.get(experience_level.lower(), (experience_level.lower(),))
+        placeholders = ", ".join(f":el{i}" for i in range(len(levels)))
+        conditions.append(f"LOWER(experience_level) IN ({placeholders})")
+        for i, lv in enumerate(levels):
+            params[f"el{i}"] = lv
+
+    if location and location not in ("all", ""):
+        if is_sqlite:
+            conditions.append("location LIKE :loc")
+        else:
+            conditions.append("location ILIKE :loc")
+        params["loc"] = f"%{location}%"
+
+    where = " AND ".join(conditions)
+
+    try:
+        with engine.connect() as conn:
+            if is_sqlite:
+                rows = conn.execute(text(f"""
+                    SELECT (salary_min + COALESCE(salary_max, salary_min)) / 2.0 AS mid_sal
+                    FROM {table}
+                    WHERE {where}
+                    ORDER BY mid_sal
+                """), params).fetchall()
+                salaries = [r[0] for r in rows if r[0] is not None]
+                if not salaries:
+                    return None
+                n = len(salaries)
+                return {
+                    "salary_p25": salaries[max(0, int(n * 0.25))],
+                    "salary_p50": salaries[max(0, int(n * 0.50))],
+                    "salary_p75": salaries[min(n - 1, int(n * 0.75))],
+                    "salary_sample_size": n,
+                    "week_start": str(date.today()),
+                }
+            else:
+                row = conn.execute(text(f"""
+                    SELECT
+                        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY mid_sal) AS salary_p25,
+                        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY mid_sal) AS salary_p50,
+                        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY mid_sal) AS salary_p75,
+                        COUNT(*) AS salary_sample_size
+                    FROM (
+                        SELECT (salary_min + COALESCE(salary_max, salary_min)) / 2.0 AS mid_sal
+                        FROM {table}
+                        WHERE {where}
+                    ) t
+                    WHERE mid_sal IS NOT NULL
+                """), params).mappings().fetchone()
+                if not row or row["salary_p50"] is None:
+                    return None
+                result = dict(row)
+                result["week_start"] = str(date.today())
+                return result
+    except Exception as exc:
+        logger.warning("salary_from_jobs.error", error=str(exc))
+        return None
 
 
 @app.get("/api/v1/market/trending", summary="Rising and declining skills")
@@ -627,6 +717,244 @@ async def get_trending_skills(
         "top_now":  list((latest.get("top_skills") or {}).keys())[:10],
         "week":     str(latest.get("week_start", "")),
     }
+    cache.set(cache_key, result)
+    return result
+
+
+# ── Market detail endpoints ───────────────────────────────────────────────────
+
+def _extract_city(location: str) -> str:
+    """Normalise 'London, UK' → 'London', 'Greater Manchester' → 'Manchester'."""
+    if not location:
+        return ""
+    city = location.split(",")[0].strip()
+    _ALIASES = {
+        "Greater London": "London", "City of London": "London",
+        "East London": "London", "North London": "London",
+        "South London": "London", "West London": "London",
+        "Central London": "London", "London Area": "London",
+        "Greater Manchester": "Manchester", "Edinburgh City": "Edinburgh",
+        "City of Edinburgh": "Edinburgh", "City of Bristol": "Bristol",
+        "City of Birmingham": "Birmingham",
+    }
+    return _ALIASES.get(city, city)
+
+
+@app.get("/api/v1/market/hiring-velocity", summary="Hiring velocity by role")
+async def get_hiring_velocity() -> dict:
+    cache_key = "hiring_velocity"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+    from collections import defaultdict
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
+
+    _ROLE_DISPLAY = {
+        "ml_engineer":    "ML Engineer",
+        "ai_engineer":    "AI / LLM Engineer",
+        "mlops_engineer": "MLOps / Platform",
+        "ai_safety":      "AI Safety Engineer",
+        "data_scientist": "Data Scientist",
+        "data_analyst":   "Data Analyst",
+        "nlp_engineer":   "NLP Engineer",
+        "data_engineer":  "Data Engineer",
+        "cv_engineer":    "Computer Vision Eng.",
+        "ai_researcher":  "AI Researcher",
+    }
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT role_category, job_count, week_start
+            FROM {table}
+            WHERE role_category != 'all'
+            ORDER BY week_start DESC
+            LIMIT 30
+        """)).mappings().fetchall()
+
+    role_weeks: dict = defaultdict(list)
+    for r in rows:
+        role_weeks[r["role_category"]].append(
+            {"job_count": r["job_count"] or 0, "week_start": str(r["week_start"])}
+        )
+
+    velocity = []
+    for role, weeks in role_weeks.items():
+        if len(weeks) >= 2:
+            current  = weeks[0]["job_count"]
+            previous = weeks[1]["job_count"]
+            growth_pct = round((current - previous) / max(previous, 1) * 100, 1)
+            direction  = "up" if growth_pct >= 0 else "down"
+        else:
+            growth_pct = 0.0
+            direction  = "neutral"
+        velocity.append({
+            "role":          _ROLE_DISPLAY.get(role, role.replace("_", " ").title()),
+            "role_category": role,
+            "growth_pct":    growth_pct,
+            "direction":     direction,
+        })
+
+    velocity.sort(key=lambda x: -abs(x["growth_pct"]))
+    result = {"velocity": velocity}
+    cache.set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/market/cities", summary="Top UK hiring cities")
+async def get_cities() -> dict:
+    cache_key = "cities"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+    from datetime import date, timedelta
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "jobs" if is_sqlite else "market.jobs"
+
+    today      = date.today()
+    week_start = today - timedelta(days=today.weekday())
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT location, COUNT(*) AS cnt
+            FROM {table}
+            WHERE location IS NOT NULL
+              AND scraped_at >= :ws
+            GROUP BY location
+            ORDER BY cnt DESC
+            LIMIT 200
+        """), {"ws": str(week_start)}).fetchall()
+
+    city_counts: dict[str, int] = {}
+    for location, cnt in rows:
+        city = _extract_city(location)
+        if city:
+            city_counts[city] = city_counts.get(city, 0) + cnt
+
+    sorted_cities = sorted(city_counts.items(), key=lambda x: -x[1])[:10]
+    cities = [{"city": c, "job_count": n} for c, n in sorted_cities]
+
+    result = {"cities": cities, "week_start": str(week_start)}
+    cache.set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/market/company-mix", summary="Company type mix")
+async def get_company_mix() -> dict:
+    cache_key = "company_mix"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "jobs" if is_sqlite else "market.jobs"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT company_stage, is_startup, COUNT(*) AS cnt
+            FROM {table}
+            GROUP BY company_stage, is_startup
+        """)).fetchall()
+        total = conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar() or 1
+
+    buckets: dict[str, int] = {
+        "Scale-up (50–500)":   0,
+        "Enterprise (500+)":   0,
+        "Startup (<50)":       0,
+        "Research / Academic": 0,
+    }
+    for stage, is_startup, cnt in rows:
+        sl = (stage or "").lower()
+        if any(k in sl for k in ("enterprise", "large", "corporate", "public")):
+            buckets["Enterprise (500+)"] += cnt
+        elif any(k in sl for k in ("research", "academic", "university", "institute")):
+            buckets["Research / Academic"] += cnt
+        elif any(k in sl for k in ("scale", "growth", "mid", "series b", "series c")):
+            buckets["Scale-up (50–500)"] += cnt
+        elif any(k in sl for k in ("startup", "early", "seed", "series a")) or is_startup:
+            buckets["Startup (<50)"] += cnt
+        else:
+            buckets["Scale-up (50–500)"] += cnt  # default unknown to scale-up
+
+    mix = [
+        {"type": t, "pct": round(n / max(total, 1) * 100, 1), "job_count": n}
+        for t, n in buckets.items()
+    ]
+    result = {"mix": mix}
+    cache.set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/market/sponsorship-by-sector", summary="Visa sponsorship rates by sector")
+async def get_sponsorship_by_sector() -> dict:
+    cache_key = "sponsorship_by_sector"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "jobs" if is_sqlite else "market.jobs"
+
+    _SECTOR_MAP = {
+        "ai_safety":      "AI Safety",
+        "cv_engineer":    "Autonomous Systems",
+        "ai_engineer":    "Autonomous Systems",
+        "nlp_engineer":   "FinTech AI",
+        "data_analyst":   "FinTech AI",
+        "data_scientist": "HealthTech AI",
+        "ml_engineer":    "Enterprise AI",
+        "mlops_engineer": "Enterprise AI",
+        "data_engineer":  "Enterprise AI",
+        "ai_researcher":  "AI Safety",
+    }
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT
+                role_category,
+                COUNT(*) AS total,
+                SUM(CASE WHEN offers_sponsorship THEN 1 ELSE 0 END) AS sponsored
+            FROM {table}
+            WHERE role_category IS NOT NULL
+            GROUP BY role_category
+            HAVING COUNT(*) >= 5
+        """)).fetchall()
+
+    sector_data: dict[str, dict] = {}
+    for role, total, sponsored in rows:
+        sector = _SECTOR_MAP.get(role, role.replace("_", " ").title())
+        if sector not in sector_data:
+            sector_data[sector] = {"total": 0, "sponsored": 0}
+        sector_data[sector]["total"]    += int(total or 0)
+        sector_data[sector]["sponsored"] += int(sponsored or 0)
+
+    sectors = [
+        {
+            "sector":           s,
+            "sponsorship_rate": round(d["sponsored"] / max(d["total"], 1), 3),
+        }
+        for s, d in sector_data.items()
+    ]
+    sectors.sort(key=lambda x: -x["sponsorship_rate"])
+    result = {"sectors": sectors}
     cache.set(cache_key, result)
     return result
 

@@ -94,7 +94,7 @@ async def techstack_node(state: MarketAnalysisState) -> dict:
     """LangGraph node — TechStackFingerprintAgent."""
     agent  = TechStackFingerprintAgent()
     result = await agent.run({"week_start": state.get("week_start", _default_week())})
-    return {"tech_archetypes": result.get("archetypes", [])}
+    return {"tech_archetypes": result.get("tech_stack_archetypes", [])}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -163,9 +163,9 @@ async def compile_snapshot(state: MarketAnalysisState) -> dict:
         "sponsorship_rate":   sponsorship_data.get("sponsorship_rate", 0),
         "remote_rate":        geo_dist.get("remote_rate", 0),
         "hybrid_rate":        hybrid_rate,
-        "startup_rate":       sponsorship_data.get("startup_rate", 0),
-        "top_cities":         geo_dist.get("city_breakdown", {}),
-        "geo_breakdown":      geo_dist.get("city_breakdown", {}),
+        "startup_rate":       sponsorship_data.get("startup_rate", sponsorship_data.get("sponsorship_rate", 0)),
+        "top_cities":         geo_dist.get("top_cities", {}),
+        "geo_breakdown":      geo_dist.get("top_cities", {}),
         "tech_archetypes":    archetypes,
         "generated_at":       datetime.utcnow().isoformat(),
     }
@@ -181,42 +181,54 @@ async def compile_snapshot(state: MarketAnalysisState) -> dict:
 
         cast = "" if is_sq else "::jsonb"
 
+        _PER_ROLE_SQL = f"""
+            INSERT INTO {snaps_t}
+                (week_start, role_category, job_count,
+                 top_skills, rising_skills, declining_skills, top_cities,
+                 salary_p10, salary_p25, salary_p50, salary_p75, salary_p90,
+                 salary_sample_size,
+                 sponsorship_rate, remote_rate, hybrid_rate, startup_rate,
+                 computed_at)
+            VALUES
+                (:ws, :rc, :jc,
+                 CAST(:ts AS TEXT){cast}, CAST(:rise AS TEXT){cast},
+                 CAST(:dec AS TEXT){cast}, CAST(:cities AS TEXT){cast},
+                 :p10, :p25, :p50, :p75, :p90,
+                 :sn,
+                 :sr, :rr, :hr, :str,
+                 NOW())
+            ON CONFLICT (week_start, role_category) DO UPDATE SET
+                job_count          = EXCLUDED.job_count,
+                top_skills         = EXCLUDED.top_skills,
+                rising_skills      = EXCLUDED.rising_skills,
+                declining_skills   = EXCLUDED.declining_skills,
+                top_cities         = EXCLUDED.top_cities,
+                salary_p10         = EXCLUDED.salary_p10,
+                salary_p25         = EXCLUDED.salary_p25,
+                salary_p50         = EXCLUDED.salary_p50,
+                salary_p75         = EXCLUDED.salary_p75,
+                salary_p90         = EXCLUDED.salary_p90,
+                salary_sample_size = EXCLUDED.salary_sample_size,
+                sponsorship_rate   = EXCLUDED.sponsorship_rate,
+                remote_rate        = EXCLUDED.remote_rate,
+                hybrid_rate        = EXCLUDED.hybrid_rate,
+                startup_rate       = EXCLUDED.startup_rate,
+                computed_at        = NOW()
+        """
+
+        def _row_params(rc: str, jc: int, ts: dict, sr: float = 0.0) -> dict:
+            return {
+                "ws": week, "rc": rc, "jc": jc,
+                "ts": _j(ts), "rise": _j([]), "dec": _j([]), "cities": _j({}),
+                "p10": None, "p25": None, "p50": None, "p75": None, "p90": None,
+                "sn": 0, "sr": sr, "rr": 0.0, "hr": 0.0, "str": 0.0,
+            }
+
         with engine.connect() as conn:
-            conn.execute(text(f"""
-                INSERT INTO {snaps_t}
-                    (week_start, role_category, job_count,
-                     top_skills, rising_skills, declining_skills, top_cities,
-                     salary_p10, salary_p25, salary_p50, salary_p75, salary_p90,
-                     salary_sample_size,
-                     sponsorship_rate, remote_rate, hybrid_rate, startup_rate,
-                     computed_at)
-                VALUES
-                    (:ws, 'all', :jc,
-                     CAST(:ts AS TEXT){cast}, CAST(:rise AS TEXT){cast},
-                     CAST(:dec AS TEXT){cast}, CAST(:cities AS TEXT){cast},
-                     :p10, :p25, :p50, :p75, :p90,
-                     :sn,
-                     :sr, :rr, :hr, :str,
-                     NOW())
-                ON CONFLICT (week_start, role_category) DO UPDATE SET
-                    job_count          = EXCLUDED.job_count,
-                    top_skills         = EXCLUDED.top_skills,
-                    rising_skills      = EXCLUDED.rising_skills,
-                    declining_skills   = EXCLUDED.declining_skills,
-                    top_cities         = EXCLUDED.top_cities,
-                    salary_p10         = EXCLUDED.salary_p10,
-                    salary_p25         = EXCLUDED.salary_p25,
-                    salary_p50         = EXCLUDED.salary_p50,
-                    salary_p75         = EXCLUDED.salary_p75,
-                    salary_p90         = EXCLUDED.salary_p90,
-                    salary_sample_size = EXCLUDED.salary_sample_size,
-                    sponsorship_rate   = EXCLUDED.sponsorship_rate,
-                    remote_rate        = EXCLUDED.remote_rate,
-                    hybrid_rate        = EXCLUDED.hybrid_rate,
-                    startup_rate       = EXCLUDED.startup_rate,
-                    computed_at        = NOW()
-            """), {
+            # Write 'all' snapshot
+            conn.execute(text(_PER_ROLE_SQL), {
                 "ws":    week,
+                "rc":    "all",
                 "jc":    job_count,
                 "ts":    _j(snapshot["top_skills"]),
                 "rise":  _j(snapshot["rising_skills"]),
@@ -233,8 +245,32 @@ async def compile_snapshot(state: MarketAnalysisState) -> dict:
                 "hr":    hybrid_rate,
                 "str":   snapshot.get("startup_rate", 0),
             })
+
+            # Build per-role sponsorship lookup from sponsorship segments
+            role_sponsorship: dict[str, float] = {}
+            for seg in sponsorship_data.get("sponsorship_segments", []):
+                rc_seg = seg.get("role_category", "")
+                if rc_seg and rc_seg not in role_sponsorship:
+                    role_sponsorship[rc_seg] = seg.get("sponsorship_rate", 0.0)
+
+            # Write per-role snapshots (job_count + top_skills + sponsorship)
+            role_skills_map: dict[str, dict] = skill_trends.get("role_skills", {})
+            for role_cat, role_top_skills in role_skills_map.items():
+                if not role_top_skills:
+                    continue
+                conn.execute(text(_PER_ROLE_SQL), _row_params(
+                    rc=role_cat,
+                    jc=role_velocity.get(role_cat, 0),
+                    ts=role_top_skills,
+                    sr=role_sponsorship.get(role_cat, 0.0),
+                ))
+
             conn.commit()
-        logger.info("market_analysis.snapshot.saved", week=week, jobs=job_count)
+
+        logger.info(
+            "market_analysis.snapshot.saved",
+            week=week, jobs=job_count, per_role=len(role_skills_map),
+        )
     except Exception as exc:
         logger.error("market_analysis.snapshot.save_failed", error=str(exc))
 

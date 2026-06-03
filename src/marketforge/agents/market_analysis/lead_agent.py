@@ -189,6 +189,7 @@ class SkillDemandAnalystAgent(DeepAgent):
             "top_skills":      result.get("top_skills",      {}),
             "rising_skills":   result.get("rising_skills",   []),
             "declining_skills":result.get("declining_skills",[]),
+            "role_skills":     result.get("role_skills",     {}),
         }
 
 
@@ -1036,24 +1037,61 @@ class MarketAnalystLeadAgent(DeepAgent):
         # Persist global 'all' snapshot
         self._write_snapshot(snapshot)
 
-        # Persist per-role snapshots so CV analyser can query role-specific data
-        role_skills = skill_out.get("role_skills", {})
+        # Persist per-role snapshots (job_count + top_skills + salary + sponsorship)
+        role_skills   = skill_out.get("role_skills", {})
+        role_velocity = velocity_out.get("role_velocity", {})
+
+        # Per-role sponsorship rates from SponsorshipTrackerAgent segments
+        role_sponsorship: dict[str, float] = {}
+        for seg in sponsor_out.get("sponsorship_segments", []):
+            rc_seg = seg.get("role_category", "")
+            if rc_seg and rc_seg not in role_sponsorship:
+                role_sponsorship[rc_seg] = seg.get("sponsorship_rate", 0.0)
+
+        # Per-role salary percentiles — compute from jobs table inline
+        role_salary: dict[str, dict] = {}
+        try:
+            from sqlalchemy import text as _text
+            with _engine().connect() as _conn:
+                for rc in role_skills:
+                    sal_rows = _conn.execute(_text(f"""
+                        SELECT (salary_min + COALESCE(salary_max, salary_min)) / 2.0 AS mid
+                        FROM {_t('jobs')}
+                        WHERE role_category = :rc
+                          AND salary_min IS NOT NULL
+                          AND salary_min > 10000
+                          AND (salary_max IS NULL OR salary_max < 600000)
+                        ORDER BY mid
+                    """), {"rc": rc}).fetchall()
+                    mids = [r[0] for r in sal_rows if r[0]]
+                    n = len(mids)
+                    if n >= 5:
+                        role_salary[rc] = {
+                            "salary_p25": mids[max(0, int(n * 0.25))],
+                            "salary_p50": mids[max(0, int(n * 0.50))],
+                            "salary_p75": mids[min(n - 1, int(n * 0.75))],
+                            "salary_sample_size": n,
+                        }
+        except Exception as _exc:
+            logger.warning("market_analyst.per_role_salary.error", error=str(_exc))
+
         for role_cat, top_skills in role_skills.items():
             if not top_skills:
                 continue
+            sal = role_salary.get(role_cat, {})
             role_snap = {
-                "week_start":       week,
-                "role_category":    role_cat,
-                "top_skills":       top_skills,
-                "rising_skills":    [],   # velocity per-role not yet tracked
-                "declining_skills": [],
-                "salary_p25":       None,
-                "salary_p50":       None,
-                "salary_p75":       None,
-                "salary_sample_size": 0,
-                "job_count":        sum(top_skills.values()),
-                "sponsorship_rate": 0,
-                "top_cities":       {},
+                "week_start":         week,
+                "role_category":      role_cat,
+                "top_skills":         top_skills,
+                "rising_skills":      [],
+                "declining_skills":   [],
+                "salary_p25":         sal.get("salary_p25"),
+                "salary_p50":         sal.get("salary_p50"),
+                "salary_p75":         sal.get("salary_p75"),
+                "salary_sample_size": sal.get("salary_sample_size", 0),
+                "job_count":          role_velocity.get(role_cat, sum(top_skills.values())),
+                "sponsorship_rate":   role_sponsorship.get(role_cat, 0.0),
+                "top_cities":         {},
             }
             self._write_snapshot(role_snap)
 
