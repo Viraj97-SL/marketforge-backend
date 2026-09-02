@@ -511,6 +511,40 @@ async def get_market_snapshot(
     return MarketSnapshotResponse(**{k: data[k] for k in MarketSnapshotResponse.model_fields if k in data})
 
 
+@app.get("/api/v1/market/snapshot-history", summary="Weekly snapshot history (real time series)")
+async def get_snapshot_history(
+    weeks: int = Query(default=26, ge=1, le=104, description="How many recent weeks to return"),
+) -> dict:
+    cache_key = f"snapshot_history:{weeks}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT week_start, job_count, salary_p50, sponsorship_rate
+            FROM {table}
+            WHERE role_category = 'all'
+            ORDER BY week_start DESC LIMIT :n
+        """), {"n": weeks}).fetchall()
+
+    result = {
+        "role_category": "all",
+        "weeks": [
+            {"week_start": str(ws), "job_count": jc, "salary_p50": p50, "sponsorship_rate": sr}
+            for ws, jc, p50, sr in reversed(rows)
+        ],
+    }
+    cache.set(cache_key, result)
+    return result
+
+
 @app.get("/api/v1/market/skills", summary="Top skills by role category")
 async def get_top_skills(
     role_category: str = Query(default="all"),
