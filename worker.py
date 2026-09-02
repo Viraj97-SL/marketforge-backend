@@ -11,6 +11,8 @@ Schedule (UTC):
   Mon       07:00  — weekly analysis only (snapshot + report, no scrape)
   Sun       02:00  — model retrain
   Every 6h         — Redis cache refresh
+  1st @ 03:00      — external stats refresh (ONS vacancy trend, GOV.UK sponsor
+                      register match, ONS ASHE salary benchmark)
 
 Usage:
     python worker.py                  # Start the scheduler (blocks forever)
@@ -242,13 +244,44 @@ def job_cache_refresh() -> None:
         log.warning("worker.cache_refresh.failed", error=str(exc))
 
 
+def job_external_stats() -> None:
+    """Refresh ONS vacancy trend, sponsor register match, ASHE salary benchmark."""
+    from marketforge.utils.logger import setup_logging
+    from marketforge.memory.postgres import init_database
+    setup_logging()
+    run_id = f"worker_external_stats_{uuid.uuid4().hex[:8]}"
+    log.info("worker.external_stats.start", run_id=run_id)
+
+    try:
+        init_database()
+        from marketforge.agents.research.lead_agent import ExternalStatsLeadAgent
+        lead = ExternalStatsLeadAgent()
+        async def _run_external_stats():
+            plan = await lead.plan({}, {})
+            result = await lead.execute(plan, {})
+            reflection = await lead.reflect(plan, result, {})
+            return await lead.output(result, reflection)
+        summary = asyncio.run(_run_external_stats())
+        log.info("worker.external_stats.done", run_id=run_id, **summary)
+
+        from marketforge.memory.redis_cache import DashboardCache
+        try:
+            DashboardCache().invalidate()
+        except Exception:
+            pass
+    except Exception as exc:
+        log.error("worker.external_stats.failed", run_id=run_id, error=str(exc))
+        raise
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 JOBS = {
-    "ingest":   job_ingest,
-    "analysis": job_weekly_analysis,
-    "retrain":  job_model_retrain,
-    "cache":    job_cache_refresh,
+    "ingest":         job_ingest,
+    "analysis":       job_weekly_analysis,
+    "retrain":        job_model_retrain,
+    "cache":          job_cache_refresh,
+    "external_stats": job_external_stats,
 }
 
 
@@ -281,6 +314,11 @@ def main() -> None:
     # dag_dashboard_refresh — every 6 hours
     scheduler.add_job(job_cache_refresh, CronTrigger.from_crontab("0 */6 * * *"),
                       id="cache_refresh", max_instances=1, coalesce=True)
+
+    # dag_external_stats — 1st of the month, 03:00 UTC (ONS/GOV.UK sources update
+    # far less often than our own scrape; sub-agents skip cheaply when nothing's new)
+    scheduler.add_job(job_external_stats, CronTrigger.from_crontab("0 3 1 * *"),
+                      id="external_stats", max_instances=1, coalesce=True)
 
     log.info("worker.scheduler.started", jobs=[j.id for j in scheduler.get_jobs()])
     try:

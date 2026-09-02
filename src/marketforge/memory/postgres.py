@@ -393,6 +393,44 @@ CREATE TABLE IF NOT EXISTS market.skill_trends (
     UNIQUE(week_start, skill, role_category)
 );
 
+-- ── External trusted-source stats (ONS, GOV.UK) ─────────────────────────────────
+-- National vacancy trend (ONS dataset VACS02) — real macro backdrop for the
+-- Hiring Velocity section, independent of how much of our own sample exists.
+CREATE TABLE IF NOT EXISTS market.external_ons_vacancies (
+    id              BIGSERIAL PRIMARY KEY,
+    month           TEXT NOT NULL,
+    industry_code   TEXT NOT NULL,
+    industry_label  TEXT NOT NULL,
+    vacancies_index REAL NOT NULL,
+    fetched_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(month, industry_code)
+);
+
+-- Company-level match against the GOV.UK Register of Licensed Sponsors —
+-- an authoritative alternative to the offers_sponsorship text heuristic.
+CREATE TABLE IF NOT EXISTS market.external_sponsor_matches (
+    company_name_normalized TEXT PRIMARY KEY,
+    is_licensed_sponsor     BOOLEAN NOT NULL DEFAULT FALSE,
+    matched_register_name   TEXT,
+    fetched_at              TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ONS ASHE Table 14 salary benchmark by occupation (4-digit SOC), mapped to
+-- our role_category taxonomy — authoritative pay bands alongside our own
+-- scraped percentiles.
+CREATE TABLE IF NOT EXISTS market.external_ashe_salary (
+    id              BIGSERIAL PRIMARY KEY,
+    role_category   TEXT NOT NULL,
+    soc_code        TEXT NOT NULL,
+    soc_title       TEXT NOT NULL,
+    year            INT NOT NULL,
+    salary_p25      REAL,
+    salary_p50      REAL,
+    salary_p75      REAL,
+    fetched_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(role_category, soc_code, year)
+);
+
 -- ── Indexes ───────────────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_jobs_dedup          ON market.jobs(dedup_hash);
 CREATE INDEX IF NOT EXISTS idx_jobs_run            ON market.jobs(run_id);
@@ -417,6 +455,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_logs_run      ON market.agent_logs(run_id);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_dept     ON market.agent_logs(department);
 CREATE INDEX IF NOT EXISTS idx_seen_jobs_hash      ON market.seen_jobs(dedup_hash);
 CREATE INDEX IF NOT EXISTS idx_llm_cache_expires   ON market.llm_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_ons_vacancies_month ON market.external_ons_vacancies(month);
+CREATE INDEX IF NOT EXISTS idx_ashe_salary_role    ON market.external_ashe_salary(role_category);
 """
 
 

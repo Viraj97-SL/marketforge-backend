@@ -959,6 +959,125 @@ async def get_sponsorship_by_sector() -> dict:
     return result
 
 
+# ── External trusted-source endpoints (ONS, GOV.UK) ─────────────────────────────
+# Populated by worker.py's monthly `external_stats` job — see
+# marketforge.agents.research.{ons_vacancy_agent,sponsor_register_agent,ashe_salary_agent}.
+# Every response is honestly captioned with its source/methodology since these
+# replace figures that used to be presented as real analysis but weren't.
+
+@app.get("/api/v1/market/external/vacancy-trend", summary="ONS national vacancy trend (tech sector proxy)")
+async def get_external_vacancy_trend() -> dict:
+    cache_key = "external_vacancy_trend"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "external_ons_vacancies" if is_sqlite else "market.external_ons_vacancies"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT month, vacancies_index FROM {table}
+            ORDER BY month ASC
+        """)).fetchall()
+
+    result = {
+        "source": "ONS, dataset LMS, CDID JP9P",
+        "series_label": "UK Job Vacancies (thousands) — Information & Communication",
+        "methodology": (
+            "ONS does not publish an AI/ML-specific vacancy series. This is the "
+            "closest official proxy (the SIC section covering software/tech "
+            "employers) and is shown as sector context, not a literal AI-jobs count."
+        ),
+        "trend": [{"month": m, "vacancies_index": v} for m, v in rows],
+    }
+    cache.set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/market/external/sponsor-verification", summary="Sponsor register verification rate")
+async def get_external_sponsor_verification() -> dict:
+    cache_key = "external_sponsor_verification"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "external_sponsor_matches" if is_sqlite else "market.external_sponsor_matches"
+
+    with engine.connect() as conn:
+        row = conn.execute(text(f"""
+            SELECT COUNT(*), SUM(CASE WHEN is_licensed_sponsor THEN 1 ELSE 0 END)
+            FROM {table}
+        """)).fetchone()
+
+    sample_size = int(row[0] or 0)
+    verified    = int(row[1] or 0)
+    result = {
+        "source": "GOV.UK Register of Licensed Sponsors: Workers",
+        "methodology": (
+            "Employer names scraped this quarter are normalised and matched "
+            "against the official register. verified_pct is the share of "
+            "distinct employers that are actually licensed to sponsor visas — "
+            "an authoritative alternative to text-based sponsorship claims in "
+            "job postings."
+        ),
+        "sample_size":  sample_size,
+        "verified_pct": round(verified / max(sample_size, 1), 3) if sample_size else None,
+    }
+    cache.set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/market/external/salary-benchmark", summary="ONS ASHE salary benchmark by role")
+async def get_external_salary_benchmark() -> dict:
+    cache_key = "external_salary_benchmark"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "external_ashe_salary" if is_sqlite else "market.external_ashe_salary"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT role_category, soc_code, soc_title, year, salary_p25, salary_p50, salary_p75
+            FROM {table}
+            WHERE year = (SELECT MAX(year) FROM {table})
+        """)).fetchall()
+
+    result = {
+        "source": "ONS Annual Survey of Hours and Earnings (ASHE), Table 14",
+        "methodology": (
+            "ONS does not publish a distinct occupation code for 'Data Scientist', "
+            "'ML Engineer', etc. Every role_category below is benchmarked against "
+            "the closest official proxy — SOC 2134 'Programmers and software "
+            "development professionals' — not a per-role ONS figure."
+        ),
+        "benchmarks": [
+            {
+                "role_category": rc, "soc_code": soc, "soc_title": title, "year": yr,
+                "salary_p25": p25, "salary_p50": p50, "salary_p75": p75,
+            }
+            for rc, soc, title, yr, p25, p50, p75 in rows
+        ],
+    }
+    cache.set(cache_key, result)
+    return result
+
+
 # ── Jobs listing endpoint ─────────────────────────────────────────────────────
 
 @app.get("/api/v1/jobs", summary="Browse indexed UK AI/ML job listings")

@@ -37,6 +37,7 @@ pydantic>=2.7.0
 pydantic-settings>=2.3.0
 pandas>=2.2.0
 numpy>=1.26.0
+openpyxl>=3.1.0                # ONS ASHE salary benchmark .xlsx parsing
 
 # ── Persistence ──────────────────────────────────────────────────────────────
 sqlalchemy>=2.0.0
