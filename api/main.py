@@ -1078,6 +1078,218 @@ async def get_external_salary_benchmark() -> dict:
     return result
 
 
+@app.get("/api/v1/market/external/graduate-outcomes", summary="UK graduate employment outcomes + pipeline size")
+async def get_graduate_outcomes() -> dict:
+    cache_key = "graduate_outcomes"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    emp_table = "external_grad_employment" if is_sqlite else "market.external_grad_employment"
+    hc_table  = "external_grad_headcount"  if is_sqlite else "market.external_grad_headcount"
+
+    with engine.connect() as conn:
+        emp_row = conn.execute(text(f"""
+            SELECT year, employment_rate, hs_employment_rate, unemployment_rate, inactivity_rate
+            FROM {emp_table} ORDER BY year DESC LIMIT 1
+        """)).fetchone()
+        hc_row = conn.execute(text(f"""
+            SELECT year, qualifiers_count FROM {hc_table}
+            WHERE subject = 'Computing' ORDER BY year DESC LIMIT 1
+        """)).fetchone()
+
+    result = {
+        "source": "DfE Explore Education Statistics (data.explore-education-statistics.service.gov.uk)",
+        "methodology": (
+            "employment_rate/unemployment_rate/inactivity_rate are the unweighted "
+            "average of the Male and Female breakdown rows — the source dataset "
+            "publishes no unsegmented 'all graduates' row. England only, not UK-wide. "
+            "qualifiers_count is the number of Computing-subject HE qualifiers "
+            "(all levels combined) for that academic year."
+        ),
+        "employment": {
+            "year": emp_row[0], "employment_rate": emp_row[1], "hs_employment_rate": emp_row[2],
+            "unemployment_rate": emp_row[3], "inactivity_rate": emp_row[4],
+        } if emp_row else None,
+        "computing_qualifiers": {
+            "academic_year": hc_row[0], "qualifiers_count": hc_row[1],
+        } if hc_row else None,
+    }
+    cache.set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/market/entry-level/skill-shift", summary="Skill demand: overall rank vs entry-level rank")
+async def get_entry_level_skill_shift() -> dict:
+    cache_key = "entry_level_skill_shift"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+    from datetime import date, timedelta
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    jobs_t    = "jobs"       if is_sqlite else "market.jobs"
+    skills_t  = "job_skills" if is_sqlite else "market.job_skills"
+
+    since = str(date.today() - timedelta(days=90))
+
+    with engine.connect() as conn:
+        overall_rows = conn.execute(text(f"""
+            SELECT js.skill, COUNT(*) AS cnt
+            FROM {skills_t} js JOIN {jobs_t} j ON j.job_id = js.job_id
+            WHERE j.scraped_at >= :since
+            GROUP BY js.skill ORDER BY cnt DESC LIMIT 40
+        """), {"since": since}).fetchall()
+        junior_rows = conn.execute(text(f"""
+            SELECT js.skill, COUNT(*) AS cnt
+            FROM {skills_t} js JOIN {jobs_t} j ON j.job_id = js.job_id
+            WHERE j.scraped_at >= :since AND j.experience_level = 'junior'
+            GROUP BY js.skill ORDER BY cnt DESC LIMIT 40
+        """), {"since": since}).fetchall()
+
+    overall_rank = {skill: i + 1 for i, (skill, _) in enumerate(overall_rows)}
+    junior_rank  = {skill: i + 1 for i, (skill, _) in enumerate(junior_rows)}
+
+    shifts = []
+    for skill, jr in junior_rank.items():
+        orank = overall_rank.get(skill, len(overall_rank) + 5)
+        shifts.append({"skill": skill, "overall_rank": orank, "junior_rank": jr, "rank_delta": orank - jr})
+
+    shifts.sort(key=lambda x: -x["rank_delta"])
+    result = {
+        "methodology": (
+            "overall_rank is a skill's position by posting frequency across all "
+            "roles in the last 90 days; junior_rank is its position among "
+            "experience_level='junior' postings only. Positive rank_delta means "
+            "the skill matters more at entry level than the overall market ranking suggests."
+        ),
+        "shifts": shifts[:8],
+        "sample_size_junior": sum(c for _, c in junior_rows),
+    }
+    cache.set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/market/entry-level/universal-skills", summary="Skills present across the most role categories")
+async def get_entry_level_universal_skills() -> dict:
+    cache_key = "entry_level_universal_skills"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+    from datetime import date, timedelta
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    jobs_t    = "jobs"       if is_sqlite else "market.jobs"
+    skills_t  = "job_skills" if is_sqlite else "market.job_skills"
+    since = str(date.today() - timedelta(days=90))
+
+    with engine.connect() as conn:
+        span_rows = conn.execute(text(f"""
+            SELECT js.skill, COUNT(DISTINCT j.role_category) AS role_span, COUNT(*) AS total
+            FROM {skills_t} js JOIN {jobs_t} j ON j.job_id = js.job_id
+            WHERE j.scraped_at >= :since AND j.role_category IS NOT NULL
+            GROUP BY js.skill HAVING COUNT(*) >= 5
+            ORDER BY role_span DESC, total DESC LIMIT 8
+        """), {"since": since}).fetchall()
+
+        top_skills = [r[0] for r in span_rows]
+        matrix: list[dict] = []
+        if top_skills:
+            from sqlalchemy import bindparam
+            matrix_rows = conn.execute(
+                text(f"""
+                    SELECT js.skill, j.role_category, COUNT(*) AS cnt
+                    FROM {skills_t} js JOIN {jobs_t} j ON j.job_id = js.job_id
+                    WHERE j.scraped_at >= :since AND j.role_category IS NOT NULL
+                      AND js.skill IN :skills
+                    GROUP BY js.skill, j.role_category
+                """).bindparams(bindparam("skills", expanding=True)),
+                {"since": since, "skills": top_skills},
+            ).fetchall()
+            matrix = [{"skill": s, "role_category": rc, "count": c} for s, rc, c in matrix_rows]
+
+    result = {
+        "methodology": (
+            "Top skills ranked by how many distinct role categories they appear "
+            "in (last 90 days, roles with >=5 postings mentioning the skill), "
+            "not just raw frequency — these are the skills that show up "
+            "regardless of specialisation, the closest thing to a market-wide floor."
+        ),
+        "skills": [{"skill": s, "role_span": rs, "total": t} for s, rs, t in span_rows],
+        "matrix": matrix,
+    }
+    cache.set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/market/entry-level/company-mix", summary="Company type mix, entry-level postings only")
+async def get_entry_level_company_mix() -> dict:
+    cache_key = "entry_level_company_mix"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "jobs" if is_sqlite else "market.jobs"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT company_stage, is_startup, COUNT(*) AS cnt
+            FROM {table}
+            WHERE experience_level = 'junior'
+            GROUP BY company_stage, is_startup
+        """)).fetchall()
+        total = conn.execute(text(f"""
+            SELECT COUNT(*) FROM {table} WHERE experience_level = 'junior'
+        """)).scalar() or 0
+
+    buckets: dict[str, int] = {
+        "Scale-up (50–500)":   0,
+        "Enterprise (500+)":   0,
+        "Startup (<50)":       0,
+        "Research / Academic": 0,
+    }
+    for stage, is_startup, cnt in rows:
+        sl = (stage or "").lower()
+        if any(k in sl for k in ("enterprise", "large", "corporate", "public")):
+            buckets["Enterprise (500+)"] += cnt
+        elif any(k in sl for k in ("research", "academic", "university", "institute")):
+            buckets["Research / Academic"] += cnt
+        elif any(k in sl for k in ("scale", "growth", "mid", "series b", "series c")):
+            buckets["Scale-up (50–500)"] += cnt
+        elif any(k in sl for k in ("startup", "early", "seed", "series a")) or is_startup:
+            buckets["Startup (<50)"] += cnt
+        else:
+            buckets["Scale-up (50–500)"] += cnt
+
+    result = {
+        "sample_size": total,
+        "mix": [
+            {"type": t, "pct": round(n / max(total, 1) * 100, 1), "job_count": n}
+            for t, n in buckets.items()
+        ],
+    }
+    cache.set(cache_key, result)
+    return result
+
+
 # ── Jobs listing endpoint ─────────────────────────────────────────────────────
 
 @app.get("/api/v1/jobs", summary="Browse indexed UK AI/ML job listings")

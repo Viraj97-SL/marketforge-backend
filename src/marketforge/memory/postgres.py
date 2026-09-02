@@ -431,6 +431,28 @@ CREATE TABLE IF NOT EXISTS market.external_ashe_salary (
     UNIQUE(role_category, soc_code, year)
 );
 
+-- Graduate labour market outcomes (DfE Explore Education Statistics) —
+-- England-wide, Sex-breakdown average (no unsegmented row exists in the
+-- source dataset). See grad_outcomes_agent.py for the caveat.
+CREATE TABLE IF NOT EXISTS market.external_grad_employment (
+    year                INT PRIMARY KEY,
+    employment_rate     REAL NOT NULL,
+    hs_employment_rate  REAL NOT NULL,
+    unemployment_rate   REAL NOT NULL,
+    inactivity_rate     REAL NOT NULL,
+    fetched_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Computing subject qualifiers per academic year (DfE EES "Higher-Level
+-- Learners in England, by Subject").
+CREATE TABLE IF NOT EXISTS market.external_grad_headcount (
+    year             TEXT NOT NULL,
+    subject          TEXT NOT NULL,
+    qualifiers_count INT NOT NULL,
+    fetched_at       TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (year, subject)
+);
+
 -- ── Indexes ───────────────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_jobs_dedup          ON market.jobs(dedup_hash);
 CREATE INDEX IF NOT EXISTS idx_jobs_run            ON market.jobs(run_id);
