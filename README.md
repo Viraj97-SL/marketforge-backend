@@ -33,6 +33,22 @@ The separation of concerns is deliberate:
 
 ---
 
+## Recent Updates
+
+### 2026-09-03 — Data integrity fixes synced from marketforge-ai + deploy-blocking bug fixed
+
+- Synced the AI/ML relevance gate, salary integrity fixes (day-rate bug, currency detection, IQR outlier trimming), and deeper skill-extraction changes from `marketforge-ai@d5d5cf4` — see that repo's README for full detail.
+- **Fixed a deploy-blocking bug**: `pyproject.toml` had a stale duplicate `marketforge-ai` git dependency pinned to a since-renamed branch (`feature/langgraph-refactor`), which no longer resolved for an anonymous clone. Every Railway build was silently failing at the `pip install -e .` step, leaving production stuck on whichever build last succeeded — regardless of what had been pushed since. Removed the redundant declaration; `requirements.txt`'s commit-hash pin (kept current by `sync-repos.sh`) is now the only place `marketforge-ai` is declared. Confirmed fixed via a healthy post-deploy `/api/v1/health` check showing a fresh ingestion.
+- Production DB cleanup: removed 871 pre-relevance-gate irrelevant job rows, corrected 13 mis-flagged salary currencies, regenerated the weekly snapshot, flushed the Redis dashboard cache.
+
+### 2026-09-02 — Real external data endpoints synced from marketforge-ai
+
+- Synced 4 new research agents (ONS vacancy trend, Home Office sponsor register, ONS ASHE salary benchmarks, DfE graduate outcomes) and their new tables/endpoints from `marketforge-ai`.
+- Added `/api/v1/market/snapshot-history` for time-series charting on the frontend.
+- Fixed the ASHE agent grabbing the wrong workbook out of its source zip archive (was storing "hours worked" figures as if they were annual salaries).
+
+---
+
 ## Repository Layout
 
 ```
@@ -56,17 +72,14 @@ marketforge-backend/
 
 ## Core Dependency
 
-All agent, graph, NLP, and ML code is installed directly from the `marketforge-ai` git repository:
+All agent, graph, NLP, and ML code is installed directly from the `marketforge-ai` git repository — pinned to a specific commit hash (not a branch), declared exactly once:
 
-```toml
-# pyproject.toml
-[project]
-dependencies = [
-  "marketforge-ai @ git+https://github.com/Viraj97-SL/marketforge-ai.git@main"
-]
+```txt
+# requirements.txt
+marketforge-ai @ git+https://github.com/Viraj97-SL/marketforge-ai.git@<commit-hash>
 ```
 
-Railway's Dockerfile pulls this at build time, pinned to `main`. No agent code is duplicated.
+`pyproject.toml` deliberately does **not** redeclare this dependency. It used to, pinned to a branch name — that duplicate declaration silently drifted stale and broke every Railway build (see Recent Updates, 2026-09-03) until it was removed. `sync-repos.sh` (in `marketforge-ai`) keeps the commit hash current whenever files are synced between the two repos.
 
 ---
 
@@ -82,6 +95,14 @@ All user-facing inputs pass through the LangGraph Department 8 security graph (`
 | `GET` | `/api/v1/market/salary` | 100/min | Salary p25/p50/p75 benchmarks |
 | `GET` | `/api/v1/market/trending` | 100/min | Rising / declining skills week-on-week |
 | `GET` | `/api/v1/jobs` | 100/min | Browse indexed roles (filter by role, work model, visa) |
+| `GET` | `/api/v1/market/snapshot-history` | 100/min | Weekly snapshot history (job count + salary time-series) |
+| `GET` | `/api/v1/market/external/vacancy-trend` | 100/min | Real ONS vacancy trend (external, government-sourced) |
+| `GET` | `/api/v1/market/external/sponsor-verification` | 100/min | Home Office sponsor register cross-check |
+| `GET` | `/api/v1/market/external/salary-benchmark` | 100/min | ONS ASHE salary benchmark by occupation |
+| `GET` | `/api/v1/market/external/graduate-outcomes` | 100/min | DfE graduate employment outcomes |
+| `GET` | `/api/v1/market/entry-level/skill-shift` | 100/min | Entry-level vs experienced skill demand comparison |
+| `GET` | `/api/v1/market/entry-level/universal-skills` | 100/min | Skills common across all entry-level roles |
+| `GET` | `/api/v1/market/entry-level/company-mix` | 100/min | Company-type mix hiring entry-level AI/ML roles |
 | `POST` | `/api/v1/career/analyse` | 10/min | SBERT semantic match + Gemini 2.5 Pro career narrative |
 | `POST` | `/api/v1/career/cv-analyse` | 3/hour | PDF/DOCX upload → ATS score + GDPR-compliant gap plan |
 | `GET` | `/api/v1/pipeline/runs` | 100/min | Recent pipeline execution history |
