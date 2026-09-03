@@ -30,6 +30,21 @@ from apscheduler.triggers.cron import CronTrigger
 
 log = structlog.get_logger("worker")
 
+_SHORT_DESCRIPTION_CHARS = 150
+
+
+def should_use_role_implied_fallback(description: str) -> bool:
+    """
+    True only when a description is genuinely too short for the 3 NLP gates
+    to have had any real text to work with. Deliberately NOT triggered just
+    because a long description yielded zero gate hits — that used to
+    silently backfill a fixed per-role skill list indistinguishable from
+    real extraction, masking genuine extraction gaps instead of surfacing
+    them. Pulled out as its own function so this decision is unit-testable
+    without the rest of job_ingest()'s DB/scraping scaffolding.
+    """
+    return len((description or "").strip()) < _SHORT_DESCRIPTION_CHARS
+
 
 # ── Job functions ──────────────────────────────────────────────────────────────
 
@@ -147,10 +162,17 @@ def job_ingest() -> None:
                         conn.commit()
 
                 # ── Fallback: role-implied skills when description is too short ─
-                # Short snippets (<150 chars) won't have tech keywords.
-                # Infer likely skills from the classified role at lower confidence.
-                desc_too_short = len(desc.strip()) < 150
-                if desc_too_short or not skills:
+                # Short snippets (<150 chars) genuinely won't have tech
+                # keywords to extract from, so inferring from the classified
+                # role at lower confidence is reasonable there. Deliberately
+                # NOT triggered just because all 3 gates found nothing on a
+                # long, detailed description — that used to silently inject
+                # generic per-role skills indistinguishable from real
+                # extraction, masking genuine extraction gaps instead of
+                # surfacing them. A long description with zero gate hits now
+                # stays as a real signal (no job_skills rows written) rather
+                # than being backfilled with a guess.
+                if should_use_role_implied_fallback(desc):
                     implied_pairs = _ROLE_IMPLIED.get(role_cat, _ROLE_IMPLIED["other"])
                     # Keep only skills NOT already found by taxonomy gates
                     found_canonicals = {s[0] for s in skills}

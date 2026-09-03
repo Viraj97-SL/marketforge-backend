@@ -203,11 +203,16 @@ class SalaryIntelligenceAgent(DeepAgent):
     role_category × experience_level × work_model.
 
     plan():    Decides which segmentation cuts to compute based on sample size.
-               If fewer than 30 salary-disclosed jobs exist for a segment,
-               plans to fall back to the 'all' category rather than report
-               misleading low-n statistics.
+               If fewer than MIN_SAMPLE_SIZE salary-disclosed jobs exist for
+               a segment, plans to fall back to the 'all' category rather
+               than report misleading low-n statistics.
 
-    execute(): Runs IQR-based outlier removal before computing percentiles.
+    execute(): Two-layer outlier removal: a fixed absolute-bound filter
+               (£20k-£300k midpoint — catches wildly implausible values
+               regardless of sample shape) followed by real IQR-based
+               trimming computed from the sample itself (reject outside
+               Q1-1.5*IQR / Q3+1.5*IQR) once there's enough data for IQR to
+               be meaningful. Only GBP-denominated rows are included.
                Detects salary band migration by comparing P50 vs 4-week
                rolling P50. Tracks salary_disclosure_rate per source to flag
                sources systematically omitting salary data.
@@ -220,6 +225,11 @@ class SalaryIntelligenceAgent(DeepAgent):
 
     agent_id   = "salary_intelligence_v1"
     department = "market_analysis"
+
+    # Minimum sample size before percentiles are reported at all — matches
+    # the n>=10 discipline already used for sponsorship segments elsewhere
+    # in this file. The old n>=5 floor was too small for a stable percentile.
+    MIN_SAMPLE_SIZE = 10
 
     async def plan(self, context: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         week_start = context.get("week_start", str(date.today() - timedelta(days=date.today().weekday())))
@@ -245,6 +255,7 @@ class SalaryIntelligenceAgent(DeepAgent):
                     FROM {_t('jobs')}
                     WHERE scraped_at >= :since
                       AND (salary_min IS NOT NULL OR salary_max IS NOT NULL)
+                      AND salary_currency = 'GBP'
                       AND salary_min > 10000
                       AND (salary_max IS NULL OR salary_max < 600000)
                 """), {"since": since}).fetchall()
@@ -252,22 +263,27 @@ class SalaryIntelligenceAgent(DeepAgent):
                 total_jobs = conn.execute(text(f"""
                     SELECT COUNT(*) FROM {_t('jobs')} WHERE scraped_at >= :since
                 """), {"since": since}).scalar() or 1
-            if len(rows) >= 5:
+            if len(rows) >= self.MIN_SAMPLE_SIZE:
                 break
 
-        # Compute midpoints
+        # Layer 1: fixed absolute-bound filter (£20k-£300k midpoint) — cheap
+        # defense against wildly implausible values regardless of sample shape.
         midpoints = []
         for mn, mx, rc, el in rows:
             mid = ((mn or mx) + (mx or mn)) / 2
-            # IQR outlier filter: keep £20k–£300k
             if 20_000 <= mid <= 300_000:
                 midpoints.append(mid)
+
+        # Layer 2: real IQR-based outlier trimming computed from the sample
+        # itself, once there's enough data for IQR to be a meaningful signal
+        # rather than noise on a handful of points.
+        midpoints = self._iqr_trim(midpoints) if len(midpoints) >= self.MIN_SAMPLE_SIZE else midpoints
 
         midpoints.sort()
         n = len(midpoints)
 
         def pct(p: float) -> float | None:
-            if n < 5:
+            if n < self.MIN_SAMPLE_SIZE:
                 return None
             idx = max(0, int(n * p / 100) - 1)
             return round(midpoints[idx])
@@ -283,6 +299,17 @@ class SalaryIntelligenceAgent(DeepAgent):
             "sample_size":       n,
             "disclosure_rate":   round(disclosure_rate, 3),
         }
+
+    @staticmethod
+    def _iqr_trim(values: list[float]) -> list[float]:
+        """Reject points outside Q1-1.5*IQR / Q3+1.5*IQR, computed from `values` itself."""
+        s = sorted(values)
+        n = len(s)
+        q1 = s[max(0, int(n * 0.25) - 1)]
+        q3 = s[max(0, int(n * 0.75) - 1)]
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        return [v for v in s if lo <= v <= hi]
 
     async def reflect(
         self, plan: dict[str, Any], result: dict[str, Any], state: dict[str, Any]
@@ -1048,7 +1075,12 @@ class MarketAnalystLeadAgent(DeepAgent):
             if rc_seg and rc_seg not in role_sponsorship:
                 role_sponsorship[rc_seg] = seg.get("sponsorship_rate", 0.0)
 
-        # Per-role salary percentiles — compute from jobs table inline
+        # Per-role salary percentiles — compute from jobs table inline.
+        # Shares SalaryIntelligenceAgent's bound/currency/IQR discipline
+        # (previously duplicated with weaker filtering: no currency check,
+        # no £20k-£300k midpoint bound, no IQR trim, n>=5 floor) via
+        # self._salary_agent rather than re-deriving it here.
+        min_n = self._salary_agent.MIN_SAMPLE_SIZE
         role_salary: dict[str, dict] = {}
         try:
             from sqlalchemy import text as _text
@@ -1059,13 +1091,16 @@ class MarketAnalystLeadAgent(DeepAgent):
                         FROM {_t('jobs')}
                         WHERE role_category = :rc
                           AND salary_min IS NOT NULL
+                          AND salary_currency = 'GBP'
                           AND salary_min > 10000
                           AND (salary_max IS NULL OR salary_max < 600000)
                         ORDER BY mid
                     """), {"rc": rc}).fetchall()
-                    mids = [r[0] for r in sal_rows if r[0]]
+                    mids = [r[0] for r in sal_rows if r[0] and 20_000 <= r[0] <= 300_000]
+                    if len(mids) >= min_n:
+                        mids = self._salary_agent._iqr_trim(mids)
                     n = len(mids)
-                    if n >= 5:
+                    if n >= min_n:
                         role_salary[rc] = {
                             "salary_p25": mids[max(0, int(n * 0.25))],
                             "salary_p50": mids[max(0, int(n * 0.50))],

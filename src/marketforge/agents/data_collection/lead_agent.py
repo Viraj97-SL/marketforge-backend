@@ -181,6 +181,20 @@ class DataCollectionLeadAgent(DeepAgent):
             removed=dedup_report.get("removed", 0),
         )
 
+        # ── Relevance gate ────────────────────────────────────────────────────
+        # Dedup only removes near-duplicates — it has no opinion on whether a
+        # job is AI/ML-relevant at all. Adzuna and Reed searches/categories
+        # aren't narrow enough on their own (confirmed: generic "Engineer"
+        # titles like Electrical/Mechanical Engineer, and unrelated roles like
+        # Clerk, were reaching market.jobs). This is the actual reject-before-
+        # store gate; classify_role() alone never rejects anything.
+        from marketforge.nlp.taxonomy import is_ai_ml_relevant
+        relevant_jobs = [j for j in deduped_jobs if is_ai_ml_relevant(j.title, j.description)]
+        irrelevant_count = len(deduped_jobs) - len(relevant_jobs)
+        if irrelevant_count:
+            logger.info(f"{self.agent_id}.relevance_gate.rejected", count=irrelevant_count)
+        deduped_jobs = relevant_jobs
+
         # ── Refresh scraped_at for ALL jobs seen this run ─────────────────────
         # Re-scraped jobs (same dedup_hash, filtered out above) still exist in
         # market.jobs with a stale scraped_at from their first scrape run.

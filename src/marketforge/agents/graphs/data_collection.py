@@ -199,8 +199,26 @@ async def run_deduplication(state: DataCollectionState) -> dict:
         deduped=len(deduped),
         removed=raw_count - len(deduped),
     )
+
+    # ── Relevance gate ────────────────────────────────────────────────────────
+    # Dedup only removes near-duplicates — it has no opinion on whether a job
+    # is AI/ML-relevant at all. Adzuna and Reed searches/categories aren't
+    # narrow enough on their own (confirmed: generic "Engineer" titles like
+    # Electrical/Mechanical Engineer, and unrelated roles like Clerk, were
+    # reaching market.jobs). This is the actual reject-before-store gate;
+    # classify_role() alone never rejects anything. Mirrors the same gate in
+    # agents/data_collection/lead_agent.py::DataCollectionLeadAgent.execute()
+    # — this LangGraph pipeline is a separate implementation of the same
+    # collection flow, not a wrapper around that class, so the gate has to
+    # be applied here too or it never runs in a deployment using this path.
+    from marketforge.nlp.taxonomy import is_ai_ml_relevant
+    relevant = [j for j in deduped if is_ai_ml_relevant(j.title, j.description)]
+    irrelevant_count = len(deduped) - len(relevant)
+    if irrelevant_count:
+        logger.info("data_collection.relevance_gate.rejected", count=irrelevant_count)
+
     return {
-        "deduped_jobs": deduped,
+        "deduped_jobs": relevant,
         "dedup_report": report,
     }
 
