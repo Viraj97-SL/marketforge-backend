@@ -17,8 +17,16 @@ license = { text = "MIT" }
 authors = [{ name = "Viraj Bulugahapitiya", email = "amanthavirajavb@gmail.com" }]
 
 dependencies = [
-    # ── Core package (all agents, graphs, ML, NLP — installed from git) ───────
-    "marketforge-ai @ git+https://github.com/Viraj97-SL/marketforge-ai.git@feature/langgraph-refactor",
+    # marketforge-ai is deliberately NOT declared here. It's installed by
+    # `pip install -r requirements.txt` (Dockerfile step 5, run before this
+    # editable install) with the commit-hash pin that sync-repos.sh keeps
+    # current. A duplicate declaration used to live here pinned to a stale
+    # branch name (feature/langgraph-refactor) that no longer resolves
+    # cleanly for an anonymous git clone — every build was failing at this
+    # exact step (`pip install -e .`) as a result, so the site was silently
+    # stuck serving whatever last built successfully instead of any of the
+    # fixes pushed after that. Re-declaring the same package two different
+    # ways in two files is exactly how that drift happened; don't re-add it.
 
     # ── API layer ─────────────────────────────────────────────────────────────
     "fastapi>=0.111.0",
