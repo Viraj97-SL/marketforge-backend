@@ -595,8 +595,9 @@ async def get_salary_benchmark(
     role_category:    str = Query(default="all"),
     experience_level: str = Query(default="all"),
     location:         str = Query(default="all"),
+    work_model:       str = Query(default="all"),
 ) -> dict:
-    cache_key = f"salary:{role_category}:{experience_level}:{location}"
+    cache_key = f"salary:{role_category}:{experience_level}:{location}:{work_model}"
     cached    = cache.get(cache_key)
     if cached:
         return cached
@@ -606,8 +607,8 @@ async def get_salary_benchmark(
     engine    = get_sync_engine()
     is_sqlite = engine.dialect.name == "sqlite"
 
-    # Fast path: use precomputed snapshot when no experience/location filter
-    if experience_level in ("all", "") and location in ("all", ""):
+    # Fast path: use precomputed snapshot when no experience/location/work_model filter
+    if experience_level in ("all", "") and location in ("all", "") and work_model in ("all", ""):
         table = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
         with engine.connect() as conn:
             row = conn.execute(text(f"""
@@ -620,7 +621,7 @@ async def get_salary_benchmark(
             raise HTTPException(status_code=404, detail="No salary data available")
         result = dict(row)
     else:
-        result = _compute_salary_from_jobs(engine, is_sqlite, role_category, experience_level, location)
+        result = _compute_salary_from_jobs(engine, is_sqlite, role_category, experience_level, location, work_model)
         if not result:
             raise HTTPException(status_code=404, detail="No salary data available")
 
@@ -634,12 +635,18 @@ def _compute_salary_from_jobs(
     role_category: str,
     experience_level: str,
     location: str,
+    work_model: str = "all",
 ) -> dict | None:
     from sqlalchemy import text
     from datetime import date
+    from marketforge.utils.stats import clean_salary_midpoints, percentile, MIN_SALARY_SAMPLE_SIZE
 
     table = "jobs" if is_sqlite else "market.jobs"
-    conditions = ["salary_min IS NOT NULL"]
+    # salary_currency = 'GBP' matches SalaryIntelligenceAgent's filter — this
+    # endpoint used to have no currency check at all, letting non-GBP rows
+    # (and the two-layer bound/IQR defense's absence) pollute every filtered
+    # slice (by role, by experience, by location, by work model).
+    conditions = ["salary_min IS NOT NULL", "salary_currency = 'GBP'"]
     params: dict = {}
 
     if role_category and role_category != "all":
@@ -667,47 +674,34 @@ def _compute_salary_from_jobs(
             conditions.append("location ILIKE :loc")
         params["loc"] = f"%{location}%"
 
+    if work_model and work_model not in ("all", ""):
+        conditions.append("work_model = :wm")
+        params["wm"] = work_model.lower()
+
     where = " AND ".join(conditions)
 
     try:
         with engine.connect() as conn:
-            if is_sqlite:
-                rows = conn.execute(text(f"""
-                    SELECT (salary_min + COALESCE(salary_max, salary_min)) / 2.0 AS mid_sal
-                    FROM {table}
-                    WHERE {where}
-                    ORDER BY mid_sal
-                """), params).fetchall()
-                salaries = [r[0] for r in rows if r[0] is not None]
-                if not salaries:
-                    return None
-                n = len(salaries)
-                return {
-                    "salary_p25": salaries[max(0, int(n * 0.25))],
-                    "salary_p50": salaries[max(0, int(n * 0.50))],
-                    "salary_p75": salaries[min(n - 1, int(n * 0.75))],
-                    "salary_sample_size": n,
-                    "week_start": str(date.today()),
-                }
-            else:
-                row = conn.execute(text(f"""
-                    SELECT
-                        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY mid_sal) AS salary_p25,
-                        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY mid_sal) AS salary_p50,
-                        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY mid_sal) AS salary_p75,
-                        COUNT(*) AS salary_sample_size
-                    FROM (
-                        SELECT (salary_min + COALESCE(salary_max, salary_min)) / 2.0 AS mid_sal
-                        FROM {table}
-                        WHERE {where}
-                    ) t
-                    WHERE mid_sal IS NOT NULL
-                """), params).mappings().fetchone()
-                if not row or row["salary_p50"] is None:
-                    return None
-                result = dict(row)
-                result["week_start"] = str(date.today())
-                return result
+            rows = conn.execute(text(f"""
+                SELECT (salary_min + COALESCE(salary_max, salary_min)) / 2.0 AS mid_sal
+                FROM {table}
+                WHERE {where}
+            """), params).fetchall()
+        raw_midpoints = [r[0] for r in rows if r[0] is not None]
+
+        midpoints = clean_salary_midpoints(raw_midpoints)
+        midpoints.sort()
+        n = len(midpoints)
+        if n < MIN_SALARY_SAMPLE_SIZE:
+            return None
+
+        return {
+            "salary_p25": percentile(midpoints, 25),
+            "salary_p50": percentile(midpoints, 50),
+            "salary_p75": percentile(midpoints, 75),
+            "salary_sample_size": n,
+            "week_start": str(date.today()),
+        }
     except Exception as exc:
         logger.warning("salary_from_jobs.error", error=str(exc))
         return None
