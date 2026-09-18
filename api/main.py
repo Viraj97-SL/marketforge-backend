@@ -4,7 +4,9 @@ MarketForge AI — FastAPI Application
 Endpoints:
   POST /api/v1/career/analyse     — personalised career advice (LLM-backed)
   POST /api/v1/career/cv-analyse  — CV upload → ATS score + career gap plan
-  GET  /api/v1/market/skills      — top skills by role category
+  GET  /api/v1/market/skills      — top skills by role category (all-time by default, or ?week=/?days=)
+  GET  /api/v1/market/roles       — top roles by job demand (all-time by default, or ?days=)
+  GET  /api/v1/market/skill-cooccurrence — skills that pair together in the same postings
   GET  /api/v1/market/salary      — salary benchmarks
   GET  /api/v1/market/snapshot    — full weekly market snapshot
   GET  /api/v1/market/trending    — rising / declining skill lists
@@ -549,8 +551,9 @@ async def get_snapshot_history(
 async def get_top_skills(
     role_category: str = Query(default="all"),
     week: str | None   = Query(default=None),
+    days: int | None   = Query(default=None, description="Rolling window in days; omitted = all-time"),
 ) -> dict:
-    cache_key = f"skills:{role_category}:{week or 'latest'}"
+    cache_key = f"skills:{role_category}:{week or ('days:' + str(days) if days else 'alltime')}"
     cached    = cache.get(cache_key)
     if cached:
         return cached
@@ -558,36 +561,179 @@ async def get_top_skills(
     from marketforge.memory.postgres import get_sync_engine
     from sqlalchemy import text
     import json
-    engine = get_sync_engine()
+    engine    = get_sync_engine()
     is_sqlite = engine.dialect.name == "sqlite"
-    table  = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
+    table     = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
 
     with engine.connect() as conn:
-        row = conn.execute(text(f"""
-            SELECT top_skills, rising_skills, declining_skills, week_start
+        if week:
+            # Explicit week requested — historical per-week snapshot, unchanged.
+            row = conn.execute(text(f"""
+                SELECT top_skills, rising_skills, declining_skills, week_start
+                FROM {table}
+                WHERE role_category = :rc AND week_start = :week
+            """), {"rc": role_category, "week": week}).mappings().fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"No data for role_category={role_category}, week={week}")
+            data = dict(row)
+            for k in ("top_skills", "rising_skills", "declining_skills"):
+                if isinstance(data.get(k), str):
+                    data[k] = json.loads(data[k])
+            cache.set(cache_key, data)
+            return data
+
+        # Default: live rolling/all-time aggregation over every job we've ever
+        # scraped, instead of the single latest week's ~40-90 new postings.
+        # rising/declining stay week-over-week signals, so those still come
+        # from the latest snapshot (real, unchanged) — only top_skills becomes
+        # a full-history ranking.
+        top_skills = _rolling_top_skills(engine, is_sqlite, role_category, days)
+
+        snap_row = conn.execute(text(f"""
+            SELECT rising_skills, declining_skills, week_start
             FROM {table}
             WHERE role_category = :rc
             ORDER BY week_start DESC LIMIT 1
         """), {"rc": role_category}).mappings().fetchone()
-        # Fall back to 'all' snapshot when no role-specific data exists yet
-        if not row and role_category != "all":
-            row = conn.execute(text(f"""
-                SELECT top_skills, rising_skills, declining_skills, week_start
+        if not snap_row and role_category != "all":
+            snap_row = conn.execute(text(f"""
+                SELECT rising_skills, declining_skills, week_start
                 FROM {table}
                 WHERE role_category = 'all'
                 ORDER BY week_start DESC LIMIT 1
             """)).mappings().fetchone()
 
-    if not row:
+    if not top_skills and not snap_row:
         raise HTTPException(status_code=404, detail=f"No data for role_category={role_category}")
 
-    data = dict(row)
-    for k in ("top_skills", "rising_skills", "declining_skills"):
-        if isinstance(data.get(k), str):
-            data[k] = json.loads(data[k])
+    snap = dict(snap_row) if snap_row else {}
+    for k in ("rising_skills", "declining_skills"):
+        if isinstance(snap.get(k), str):
+            snap[k] = json.loads(snap[k])
 
+    data = {
+        "top_skills":       top_skills,
+        "rising_skills":    snap.get("rising_skills", []),
+        "declining_skills": snap.get("declining_skills", []),
+        "week_start":       str(snap.get("week_start", "")),
+    }
     cache.set(cache_key, data)
     return data
+
+
+def _rolling_top_skills(engine, is_sqlite: bool, role_category: str, days: int | None) -> dict[str, int]:
+    """Skill -> distinct-job count over a rolling window (or all-time when days is None).
+
+    Uses posted_date when present, falling back to scraped_at for the ~13% of
+    jobs missing it — posted_date isn't touched by the re-scrape refresh that
+    keeps scraped_at current, so it's the honest "when was this job actually
+    posted" field for a demand ranking.
+    """
+    from sqlalchemy import text
+    from datetime import date, timedelta
+
+    jobs_t   = "jobs"       if is_sqlite else "market.jobs"
+    skills_t = "job_skills" if is_sqlite else "market.job_skills"
+
+    conditions = []
+    params: dict = {}
+    if role_category and role_category != "all":
+        conditions.append("j.role_category = :rc")
+        params["rc"] = role_category
+    if days:
+        since = str(date.today() - timedelta(days=days))
+        if is_sqlite:
+            conditions.append("COALESCE(j.posted_date, DATE(j.scraped_at)) >= :since")
+        else:
+            conditions.append("COALESCE(j.posted_date, j.scraped_at::date) >= :since")
+        params["since"] = since
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT js.skill, COUNT(DISTINCT js.job_id) AS cnt
+            FROM {skills_t} js JOIN {jobs_t} j ON j.job_id = js.job_id
+            {where}
+            GROUP BY js.skill ORDER BY cnt DESC
+        """), params).fetchall()
+
+    return {skill: cnt for skill, cnt in rows}
+
+
+@app.get("/api/v1/market/roles", summary="Top roles by job demand")
+async def get_top_roles(
+    days: int | None = Query(default=None, description="Rolling window in days; omitted = all-time"),
+) -> dict:
+    cache_key = f"roles:{'days:' + str(days) if days else 'alltime'}"
+    cached    = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+    from datetime import date, timedelta
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    jobs_t    = "jobs" if is_sqlite else "market.jobs"
+
+    conditions = ["role_category IS NOT NULL", "role_category != 'other'"]
+    params: dict = {}
+    if days:
+        since = str(date.today() - timedelta(days=days))
+        if is_sqlite:
+            conditions.append("COALESCE(posted_date, DATE(scraped_at)) >= :since")
+        else:
+            conditions.append("COALESCE(posted_date, scraped_at::date) >= :since")
+        params["since"] = since
+    where = " AND ".join(conditions)
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT role_category, COUNT(*) AS cnt
+            FROM {jobs_t}
+            WHERE {where}
+            GROUP BY role_category ORDER BY cnt DESC
+        """), params).fetchall()
+
+    result = {
+        "roles": [{"role_category": rc, "job_count": cnt} for rc, cnt in rows],
+        "days":  days,
+    }
+    cache.set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/market/skill-cooccurrence", summary="Skills that pair together in the same postings")
+async def get_skill_cooccurrence(
+    limit: int = Query(default=40, ge=1, le=100),
+) -> dict:
+    cache_key = f"skill_cooccurrence:{limit}"
+    cached    = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "skill_cooccurrence" if is_sqlite else "market.skill_cooccurrence"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT skill_a, skill_b, SUM(co_count) AS total_co, MAX(pmi_score) AS pmi
+            FROM {table}
+            GROUP BY skill_a, skill_b
+            ORDER BY total_co DESC LIMIT :limit
+        """), {"limit": limit}).fetchall()
+
+    result = {
+        "pairs": [
+            {"skill_a": a, "skill_b": b, "co_count": int(co), "pmi_score": round(pmi, 4)}
+            for a, b, co, pmi in rows
+        ],
+    }
+    cache.set(cache_key, result)
+    return result
 
 
 @app.get("/api/v1/market/salary", summary="Salary benchmarks")
@@ -603,27 +749,18 @@ async def get_salary_benchmark(
         return cached
 
     from marketforge.memory.postgres import get_sync_engine
-    from sqlalchemy import text
     engine    = get_sync_engine()
     is_sqlite = engine.dialect.name == "sqlite"
 
-    # Fast path: use precomputed snapshot when no experience/location/work_model filter
-    if experience_level in ("all", "") and location in ("all", "") and work_model in ("all", ""):
-        table = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
-        with engine.connect() as conn:
-            row = conn.execute(text(f"""
-                SELECT salary_p25, salary_p50, salary_p75, salary_sample_size, week_start
-                FROM {table}
-                WHERE role_category = :rc
-                ORDER BY week_start DESC LIMIT 1
-            """), {"rc": role_category}).mappings().fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="No salary data available")
-        result = dict(row)
-    else:
-        result = _compute_salary_from_jobs(engine, is_sqlite, role_category, experience_level, location, work_model)
-        if not result:
-            raise HTTPException(status_code=404, detail="No salary data available")
+    # Always compute live from market.jobs (all-time) — a role-only query used
+    # to shortcut to the latest weekly_snapshots row, but per-role weekly job
+    # counts (4-20) are too thin to survive the currency/IQR filters, so that
+    # path returned salary_sample_size=0 for most roles most weeks even though
+    # 60-220+ salaried jobs exist per role all-time. Live is cheap at this
+    # data scale (~1.7k jobs) and is already correct for every other filter.
+    result = _compute_salary_from_jobs(engine, is_sqlite, role_category, experience_level, location, work_model)
+    if not result:
+        raise HTTPException(status_code=404, detail="No salary data available")
 
     cache.set(cache_key, result)
     return result
