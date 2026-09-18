@@ -568,11 +568,29 @@ async def get_top_skills(
     with engine.connect() as conn:
         if week:
             # Explicit week requested — historical per-week snapshot, unchanged.
-            row = conn.execute(text(f"""
-                SELECT top_skills, rising_skills, declining_skills, week_start
-                FROM {table}
-                WHERE role_category = :rc AND week_start = :week
-            """), {"rc": role_category, "week": week}).mappings().fetchone()
+            # week="latest" is the pre-computed most-recent weekly_snapshots row
+            # (what this endpoint always returned before the all-time rewrite) —
+            # kept as an opt-in mode for the "this week" chart on the skills page.
+            if week == "latest":
+                row = conn.execute(text(f"""
+                    SELECT top_skills, rising_skills, declining_skills, week_start
+                    FROM {table}
+                    WHERE role_category = :rc
+                    ORDER BY week_start DESC LIMIT 1
+                """), {"rc": role_category}).mappings().fetchone()
+                if not row and role_category != "all":
+                    row = conn.execute(text(f"""
+                        SELECT top_skills, rising_skills, declining_skills, week_start
+                        FROM {table}
+                        WHERE role_category = 'all'
+                        ORDER BY week_start DESC LIMIT 1
+                    """)).mappings().fetchone()
+            else:
+                row = conn.execute(text(f"""
+                    SELECT top_skills, rising_skills, declining_skills, week_start
+                    FROM {table}
+                    WHERE role_category = :rc AND week_start = :week
+                """), {"rc": role_category, "week": week}).mappings().fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail=f"No data for role_category={role_category}, week={week}")
             data = dict(row)
