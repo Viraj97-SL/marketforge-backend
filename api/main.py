@@ -7,6 +7,8 @@ Endpoints:
   GET  /api/v1/market/skills      — top skills by role category (all-time by default, or ?week=/?days=)
   GET  /api/v1/market/roles       — top roles by job demand (all-time by default, or ?days=)
   GET  /api/v1/market/skill-cooccurrence — skills that pair together in the same postings
+  GET  /api/v1/market/skill-matrix — top-24 skill co-occurrence matrix + clustering leaf order
+  GET  /api/v1/market/skill-history — per-skill weekly job-count history (sparklines)
   GET  /api/v1/market/salary      — salary benchmarks
   GET  /api/v1/market/snapshot    — full weekly market snapshot
   GET  /api/v1/market/trending    — rising / declining skill lists
@@ -750,6 +752,143 @@ async def get_skill_cooccurrence(
             for a, b, co, pmi in rows
         ],
     }
+    cache.set(cache_key, result)
+    return result
+
+
+def _skill_leaf_order(skills: list[str], matrix: list[list[int]]) -> list[int]:
+    """Hierarchical-clustering leaf order (average linkage, cosine-style distance
+    on co-occurrence counts) so visually adjacent rows/columns in a heatmap are
+    the most related skills, instead of an alphabetical or rank ordering. Falls
+    back to identity order if scipy can't produce a valid linkage (too few
+    skills, or a degenerate all-zero co-occurrence matrix) — the matrix endpoint
+    must never 500 just because clustering failed."""
+    n = len(skills)
+    if n < 3:
+        return list(range(n))
+    try:
+        import numpy as np
+        from scipy.cluster.hierarchy import linkage, leaves_list
+        from scipy.spatial.distance import squareform
+
+        counts = [matrix[i][i] for i in range(n)]
+        dist = np.ones((n, n))
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    dist[i, j] = 0.0
+                else:
+                    denom = (counts[i] * counts[j]) ** 0.5
+                    dist[i, j] = 1 - (matrix[i][j] / denom) if denom > 0 else 1.0
+        np.fill_diagonal(dist, 0)
+        dist = (dist + dist.T) / 2  # guard against any float asymmetry before squareform
+        condensed = squareform(dist, checks=False)
+        return leaves_list(linkage(condensed, method="average")).tolist()
+    except Exception:
+        return list(range(n))
+
+
+@app.get("/api/v1/market/skill-matrix", summary="Top-24 skill co-occurrence matrix with clustering leaf order")
+async def get_skill_matrix() -> dict:
+    """24x24 co-occurrence matrix for the top skills by all-time job count, plus a
+    hierarchical-clustering leaf order so a heatmap can group related skills
+    together instead of listing them alphabetically or by rank. Computed live
+    from market.job_skills rather than market.skill_cooccurrence — that table is
+    pre-filtered to each week's top-200-positive-PMI pairs only, which would
+    leave real gaps in a dense 24x24 grid."""
+    cache_key = "skill_matrix:top24"
+    cached    = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text, bindparam
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    skills_t  = "job_skills" if is_sqlite else "market.job_skills"
+
+    top_counts = _rolling_top_skills(engine, is_sqlite, "all", None)
+    skills = list(top_counts.keys())[:24]
+    n = len(skills)
+    idx = {s: i for i, s in enumerate(skills)}
+
+    matrix = [[0] * n for _ in range(n)]
+    for s, i in idx.items():
+        matrix[i][i] = top_counts[s]
+
+    if n >= 2:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT js1.skill AS skill_a, js2.skill AS skill_b, COUNT(DISTINCT js1.job_id) AS co
+                    FROM {skills_t} js1
+                    JOIN {skills_t} js2 ON js1.job_id = js2.job_id AND js1.skill != js2.skill
+                    WHERE js1.skill IN :skills AND js2.skill IN :skills
+                    GROUP BY js1.skill, js2.skill
+                """).bindparams(bindparam("skills", expanding=True)),
+                {"skills": skills},
+            ).fetchall()
+        for a, b, co in rows:
+            if a in idx and b in idx:
+                matrix[idx[a]][idx[b]] = int(co)
+
+    result = {
+        "skills":     [{"skill": s, "count": top_counts[s]} for s in skills],
+        "matrix":     matrix,
+        "leaf_order": _skill_leaf_order(skills, matrix),
+    }
+    cache.set(cache_key, result)
+    return result
+
+
+@app.get("/api/v1/market/skill-history", summary="Per-skill weekly job-count history for sparklines")
+async def get_skill_history(
+    skills: str = Query(..., description="Comma-separated skill names"),
+    weeks:  int = Query(default=8, ge=1, le=12),
+) -> dict:
+    skill_list = [s.strip() for s in skills.split(",") if s.strip()][:20]
+    if not skill_list:
+        raise HTTPException(status_code=400, detail="skills query param must include at least one skill")
+
+    cache_key = f"skill_history:{','.join(sorted(skill_list))}:{weeks}"
+    cached    = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from sqlalchemy import text
+    import json
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+    table     = "weekly_snapshots" if is_sqlite else "market.weekly_snapshots"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT week_start, top_skills
+            FROM {table}
+            WHERE role_category = 'all'
+            ORDER BY week_start DESC LIMIT :weeks
+        """), {"weeks": weeks}).mappings().fetchall()
+
+    rows = list(reversed(rows))  # oldest -> newest, so the sparkline reads left-to-right chronologically
+
+    week_labels: list[str] = []
+    series: dict[str, list[int]] = {s: [] for s in skill_list}
+    for row in rows:
+        week_labels.append(str(row["week_start"]))
+        top = row["top_skills"]
+        if isinstance(top, str):
+            top = json.loads(top) if top else {}
+        top = top or {}
+        for s in skill_list:
+            # A skill absent from that week's top_skills blob means it wasn't in
+            # the top-N tracked that week, not necessarily zero postings that
+            # week — we still record 0 so every series is exactly `weeks` long,
+            # but treat this as an honest floor, not a literal weekly count for
+            # a skill that fell outside that week's tracked top-N.
+            series[s].append(int(top.get(s, 0)))
+
+    result = {"weeks": week_labels, "series": series}
     cache.set(cache_key, result)
     return result
 
