@@ -3,7 +3,7 @@
 # APScheduler replaces Airflow. Railway provides PostgreSQL + Redis.
 
 # ── Core package (agents, graphs, ML, NLP) ───────────────────────────────────
-marketforge-ai @ git+https://github.com/Viraj97-SL/marketforge-ai.git@a3f315bd6344ba511f697d7f1d69085946ed30be
+marketforge-ai @ git+https://github.com/Viraj97-SL/marketforge-ai.git@2800c68c5d14b01e446c26a7130badc8fabe6f89
 
 # ── Agent Orchestration ──────────────────────────────────────────────────────
 langgraph>=0.2.0
@@ -22,6 +22,7 @@ rank-bm25>=0.2.2
 
 # ── ML (inference only — no training) ───────────────────────────────────────
 scikit-learn>=1.4.0
+scipy>=1.11.0
 lightgbm>=4.3.0
 
 # ── Web / Scraping ───────────────────────────────────────────────────────────
