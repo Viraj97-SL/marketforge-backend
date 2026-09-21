@@ -10,6 +10,7 @@ Endpoints:
   GET  /api/v1/market/skill-matrix — top-24 skill co-occurrence matrix + clustering leaf order
   GET  /api/v1/market/skill-history — per-skill weekly job-count history (sparklines)
   GET  /api/v1/market/salary      — salary benchmarks
+  GET  /api/v1/market/salary-histogram — binned distribution of stated salaries
   GET  /api/v1/market/snapshot    — full weekly market snapshot
   GET  /api/v1/market/trending    — rising / declining skill lists
   GET  /api/v1/health             — pipeline health and data freshness
@@ -923,17 +924,21 @@ async def get_salary_benchmark(
     return result
 
 
-def _compute_salary_from_jobs(
+def _cleaned_salary_midpoints(
     engine,
     is_sqlite: bool,
     role_category: str,
     experience_level: str,
     location: str,
     work_model: str = "all",
-) -> dict | None:
+) -> list[float]:
+    """Sorted, outlier-cleaned salary midpoints for the given filters — the
+    single source of truth for every salary stat derived from market.jobs
+    (percentiles in _compute_salary_from_jobs, histogram bins in
+    get_salary_histogram). Keeping this in one place means those two can
+    never quietly drift onto different underlying samples."""
     from sqlalchemy import text
-    from datetime import date
-    from marketforge.utils.stats import clean_salary_midpoints, percentile, MIN_SALARY_SAMPLE_SIZE
+    from marketforge.utils.stats import clean_salary_midpoints
 
     table = "jobs" if is_sqlite else "market.jobs"
     # salary_currency = 'GBP' matches SalaryIntelligenceAgent's filter — this
@@ -974,17 +979,32 @@ def _compute_salary_from_jobs(
 
     where = " AND ".join(conditions)
 
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text(f"""
-                SELECT (salary_min + COALESCE(salary_max, salary_min)) / 2.0 AS mid_sal
-                FROM {table}
-                WHERE {where}
-            """), params).fetchall()
-        raw_midpoints = [r[0] for r in rows if r[0] is not None]
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT (salary_min + COALESCE(salary_max, salary_min)) / 2.0 AS mid_sal
+            FROM {table}
+            WHERE {where}
+        """), params).fetchall()
+    raw_midpoints = [r[0] for r in rows if r[0] is not None]
 
-        midpoints = clean_salary_midpoints(raw_midpoints)
-        midpoints.sort()
+    midpoints = clean_salary_midpoints(raw_midpoints)
+    midpoints.sort()
+    return midpoints
+
+
+def _compute_salary_from_jobs(
+    engine,
+    is_sqlite: bool,
+    role_category: str,
+    experience_level: str,
+    location: str,
+    work_model: str = "all",
+) -> dict | None:
+    from datetime import date
+    from marketforge.utils.stats import percentile, MIN_SALARY_SAMPLE_SIZE
+
+    try:
+        midpoints = _cleaned_salary_midpoints(engine, is_sqlite, role_category, experience_level, location, work_model)
         n = len(midpoints)
         if n < MIN_SALARY_SAMPLE_SIZE:
             return None
@@ -999,6 +1019,73 @@ def _compute_salary_from_jobs(
     except Exception as exc:
         logger.warning("salary_from_jobs.error", error=str(exc))
         return None
+
+
+@app.get("/api/v1/market/salary-histogram", summary="Binned distribution of stated salaries")
+async def get_salary_histogram(
+    role_category:    str = Query(default="all"),
+    experience_level: str = Query(default="all"),
+    location:         str = Query(default="all"),
+    work_model:       str = Query(default="all"),
+) -> dict:
+    """£2,500-wide bins from £20k to £160k plus one overflow bin (£160k+,
+    bounded at £300k by the same SALARY_MIDPOINT_MAX every other salary
+    stat on this API respects), built from the exact same cleaned midpoint
+    list that /api/v1/market/salary derives its P25/P50/P75 from — the
+    histogram and the quartile track above it can never disagree."""
+    cache_key = f"salary_histogram:{role_category}:{experience_level}:{location}:{work_model}"
+    cached    = cache.get(cache_key)
+    if cached:
+        return cached
+
+    from marketforge.memory.postgres import get_sync_engine
+    from marketforge.utils.stats import percentile, MIN_SALARY_SAMPLE_SIZE
+
+    engine    = get_sync_engine()
+    is_sqlite = engine.dialect.name == "sqlite"
+
+    BIN_WIDTH  = 2_500
+    BIN_FLOOR  = 20_000
+    BIN_CEIL   = 160_000
+
+    try:
+        midpoints = _cleaned_salary_midpoints(engine, is_sqlite, role_category, experience_level, location, work_model)
+    except Exception as exc:
+        logger.warning("salary_histogram.error", error=str(exc))
+        midpoints = []
+
+    n = len(midpoints)
+    if n == 0:
+        result = {"bins": [], "p25": None, "p50": None, "p75": None, "n": 0}
+        cache.set(cache_key, result)
+        return result
+
+    bin_count = int((BIN_CEIL - BIN_FLOOR) / BIN_WIDTH)  # 56
+    counts = [0] * bin_count
+    overflow = 0
+    for m in midpoints:
+        if m >= BIN_CEIL:
+            overflow += 1
+            continue
+        idx = int((m - BIN_FLOOR) // BIN_WIDTH)
+        idx = min(max(idx, 0), bin_count - 1)
+        counts[idx] += 1
+
+    bins = [
+        {"min": BIN_FLOOR + i * BIN_WIDTH, "max": BIN_FLOOR + (i + 1) * BIN_WIDTH, "count": counts[i]}
+        for i in range(bin_count)
+    ]
+    bins.append({"min": BIN_CEIL, "max": None, "count": overflow})
+
+    result = {
+        "bins": bins,
+        "p25": percentile(midpoints, 25) if n >= MIN_SALARY_SAMPLE_SIZE else None,
+        "p50": percentile(midpoints, 50) if n >= MIN_SALARY_SAMPLE_SIZE else None,
+        "p75": percentile(midpoints, 75) if n >= MIN_SALARY_SAMPLE_SIZE else None,
+        "n": n,
+    }
+    cache.set(cache_key, result)
+    return result
 
 
 @app.get("/api/v1/market/trending", summary="Rising and declining skills")
