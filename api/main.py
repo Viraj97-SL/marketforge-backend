@@ -150,7 +150,7 @@ class UserProfile(BaseModel):
 
 
 class CareerIntelligenceReport(BaseModel):
-    market_match_pct:     float
+    market_match_pct:     int
     match_distribution:   dict[str, float]    # strong / moderate / weak
     top_skill_gaps:       list[dict[str, Any]]
     sector_fit:           list[dict[str, Any]]
@@ -223,7 +223,7 @@ async def analyse_career(profile: UserProfile, request: Request, fastapi_respons
     narrative, sec_warnings = validate_output(narrative)
 
     return CareerIntelligenceReport(
-        market_match_pct=round(match_pct, 1),
+        market_match_pct=round(match_pct),
         match_distribution=match_dist,
         top_skill_gaps=skill_gaps[:5],
         sector_fit=sector_fit[:3],
@@ -1843,11 +1843,11 @@ async def health() -> HealthResponse:
 # ── CV Upload + ATS Score + Career Gap endpoint ───────────────────────────────
 
 class CVATSBreakdown(BaseModel):
-    keyword_match: float
-    structure:     float
-    readability:   float
-    completeness:  float
-    format_safety: float
+    keyword_match: int
+    structure:     int
+    readability:   int
+    completeness:  int
+    format_safety: int
 
 
 class CVGapPlan(BaseModel):
@@ -1858,14 +1858,14 @@ class CVGapPlan(BaseModel):
 
 class CVAnalysisReport(BaseModel):
     session_token:     str              # anonymous, no PII
-    ats_score:         float            # 0–100
+    ats_score:         int              # 0–100
     ats_grade:         str              # A+/A/B/C/D
     ats_breakdown:     CVATSBreakdown
     ats_issues:        list[str]        # actionable fix suggestions
     skills_found:      list[str]        # skills extracted from CV
     skills_missing:    list[str]        # top market skills not in CV
-    keyword_match_pct: float
-    market_match_pct:  float
+    keyword_match_pct: int
+    market_match_pct:  int
     gap_plan:          CVGapPlan
     narrative_summary: str
     pii_scrubbed:      list[str]        # PII types that were found and stripped
@@ -2004,7 +2004,7 @@ async def analyse_cv(
         skills_found      = ats.skills_found,
         skills_missing    = skills_missing,
         keyword_match_pct = ats.keyword_match_pct,
-        market_match_pct  = round(match_pct, 1),
+        market_match_pct  = round(match_pct),
         gap_plan          = gap_plan,
         narrative_summary = narrative,
         pii_scrubbed      = gdpr_ctx.pii_types_found,

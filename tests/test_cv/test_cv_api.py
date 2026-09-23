@@ -250,6 +250,21 @@ class TestHappyPath:
             assert dim in breakdown
             assert 0 <= breakdown[dim] <= 100
 
+    def test_no_score_in_response_carries_a_decimal(self, client):
+        # Symptom: UI showed "ATS 70.2", "Readability 82.6" — every score in
+        # the JSON contract must be a whole number, not just rounded-but-float.
+        pdf  = _make_pdf()
+        data = client.post(
+            "/api/v1/career/cv-analyse",
+            files={"cv_file": ("cv.pdf", pdf, "application/pdf")},
+            params={"target_role": "ml_engineer", "consent": "true"},
+        ).json()
+        assert isinstance(data["ats_score"], int)
+        assert isinstance(data["keyword_match_pct"], int)
+        assert isinstance(data["market_match_pct"], int)
+        for dim, val in data["ats_breakdown"].items():
+            assert isinstance(val, int), f"{dim} breakdown value {val!r} is not an int"
+
     def test_gap_plan_has_all_horizons(self, client):
         pdf  = _make_pdf()
         data = client.post(

@@ -255,3 +255,13 @@ class TestFullScoreCV:
         cv     = _cv(raw_text="ML Engineer with experience")
         result = score_cv(cv, "ml_engineer", extra_skills=["PyTorch", "LangGraph"])
         assert "PyTorch" in result.skills_found or len(result.skills_found) >= 0
+
+    def test_scores_are_whole_numbers(self):
+        # Symptom: UI showed "ATS 70.2", "Readability 82.6" — the response
+        # must never carry a fractional score at any of these levels.
+        cv     = _cv()
+        result = score_cv(cv, target_role="ml_engineer")
+        assert result.total == int(result.total)
+        assert result.keyword_match_pct == int(result.keyword_match_pct)
+        for dim, val in result.breakdown.items():
+            assert val == int(val), f"{dim} sub-score {val} is not a whole number"
