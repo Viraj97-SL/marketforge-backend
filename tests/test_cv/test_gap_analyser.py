@@ -94,6 +94,33 @@ class TestUmbrellaSuppression:
         assert "Docker" in skills
 
 
+class TestCompoundGate3StringSplitting:
+    def test_compound_string_split_and_each_part_checked_against_cv(self, monkeypatch):
+        # Real observed bug: Gate 3 returned "Agentic AI / Machine Learning"
+        # as ONE string, which never matched any single alias and slipped
+        # past canonicalisation whole. Both halves are contradictions here:
+        # "Agentic AI" is an alias of "Multi-agent systems" (found), and
+        # "Machine Learning" is implied by the found PyTorch + scikit-learn.
+        _mock_market(monkeypatch, {"Agentic AI / Machine Learning": 100, "Docker": 80})
+        result = analyse_gaps(
+            cv_skills=["Multi-agent systems", "PyTorch", "scikit-learn"],
+            target_role="ml_engineer",
+        )
+        skills = [g.skill for g in result.all_gaps]
+        assert not any("Agentic AI" in s or "Machine Learning" in s for s in skills)
+        assert "Docker" in skills
+
+    def test_llm_umbrella_suppressed_when_cv_shows_llm_tools(self, monkeypatch):
+        _mock_market(monkeypatch, {"LLM": 100, "Docker": 80})
+        result = analyse_gaps(
+            cv_skills=["OpenAI API", "Hugging Face"],
+            target_role="ml_engineer",
+        )
+        skills = [g.skill for g in result.all_gaps]
+        assert "LLM" not in skills
+        assert "Docker" in skills
+
+
 class TestBaselineBehaviourUnaffected:
     def test_genuinely_missing_specific_skill_still_appears(self, monkeypatch):
         _mock_market(monkeypatch, {"Kubernetes": 100})
