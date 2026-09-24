@@ -150,7 +150,8 @@ class UserProfile(BaseModel):
 
 
 class CareerIntelligenceReport(BaseModel):
-    market_match_pct:     int
+    market_match_pct:        int
+    market_match_sample_size: int              # postings sampled; 0 = insufficient data, market_match_pct is a placeholder
     match_distribution:   dict[str, float]    # strong / moderate / weak
     top_skill_gaps:       list[dict[str, Any]]
     sector_fit:           list[dict[str, Any]]
@@ -204,7 +205,7 @@ async def analyse_career(profile: UserProfile, request: Request, fastapi_respons
     skills_text = sec_result.sanitised_text
 
     # ── Market match via SBERT + ChromaDB ────────────────────────────────────
-    match_pct, match_dist = await asyncio.to_thread(_compute_market_match, profile.skills, profile.target_role)
+    match_pct, match_dist, match_sample_size = await asyncio.to_thread(_compute_market_match, profile.skills, profile.target_role)
 
     # ── Skill gap analysis ────────────────────────────────────────────────────
     skill_gaps            = await asyncio.to_thread(_compute_skill_gaps, profile.skills, profile.target_role)
@@ -224,6 +225,7 @@ async def analyse_career(profile: UserProfile, request: Request, fastapi_respons
 
     return CareerIntelligenceReport(
         market_match_pct=round(match_pct),
+        market_match_sample_size=match_sample_size,
         match_distribution=match_dist,
         top_skill_gaps=skill_gaps[:5],
         sector_fit=sector_fit[:3],
@@ -237,11 +239,15 @@ async def analyse_career(profile: UserProfile, request: Request, fastapi_respons
 def _compute_market_match(
     skills:      list[str],
     target_role: str = "",
-) -> tuple[float, dict[str, float]]:
+) -> tuple[float, dict[str, float], int]:
     """
     SBERT embed the skill list and compare against job descriptions for the
     target role.  When target_role is provided, only jobs with a matching
     role_category are sampled so the score reflects fit for that role.
+
+    Returns (match_pct, distribution, sample_size) — sample_size is the
+    number of postings the score was computed against; 0 means there was no
+    data at all and match_pct is a neutral placeholder, not a measurement.
     """
     try:
         import numpy as np
@@ -275,7 +281,7 @@ def _compute_market_match(
                 """)).fetchall()
 
         if not rows:
-            return 50.0, {"strong": 0.3, "moderate": 0.4, "weak": 0.3}
+            return 50.0, {"strong": 0.3, "moderate": 0.4, "weak": 0.3}, 0
 
         model       = _get_sbert()
         profile_emb = model.encode(" ".join(skills), normalize_embeddings=True)
@@ -292,10 +298,10 @@ def _compute_market_match(
             "strong":   round(strong,   3),
             "moderate": round(moderate, 3),
             "weak":     round(weak,     3),
-        }
+        }, len(rows)
     except Exception as exc:
         logger.warning("market_match.error", error=str(exc))
-        return 50.0, {"strong": 0.3, "moderate": 0.4, "weak": 0.3}
+        return 50.0, {"strong": 0.3, "moderate": 0.4, "weak": 0.3}, 0
 
 
 def _compute_skill_gaps(user_skills: list[str], target_role: str) -> list[dict[str, Any]]:
@@ -1842,6 +1848,12 @@ async def health() -> HealthResponse:
 
 # ── CV Upload + ATS Score + Career Gap endpoint ───────────────────────────────
 
+# Below this word count, a "successfully parsed" document is treated as
+# extraction failure (most commonly a scanned/image-only PDF) rather than a
+# genuinely terse CV.
+MIN_CV_WORD_COUNT = 30
+
+
 class CVATSBreakdown(BaseModel):
     keyword_match: int
     structure:     int
@@ -1864,8 +1876,11 @@ class CVAnalysisReport(BaseModel):
     ats_issues:        list[str]        # actionable fix suggestions
     skills_found:      list[str]        # skills extracted from CV
     skills_missing:    list[str]        # top market skills not in CV
-    keyword_match_pct: int
-    market_match_pct:  int
+    keyword_match_pct:         int
+    keyword_match_numerator:   int      # how many of the compared top skills were found
+    keyword_match_denominator: int      # how many top skills were compared against; 0 = no market data for this role
+    market_match_pct:          int
+    market_match_sample_size:  int      # postings sampled; 0 = no data, market_match_pct is a placeholder
     gap_plan:          CVGapPlan
     narrative_summary: str
     pii_scrubbed:      list[str]        # PII types that were found and stripped
@@ -1943,6 +1958,22 @@ async def analyse_cv(
     if cv.error:
         raise HTTPException(status_code=422, detail=f"CV could not be parsed: {cv.error}")
 
+    # A scanned/image-only PDF (or a near-blank document) "parses" without
+    # raising — pdfplumber/pypdf/python-docx just return little or no text.
+    # That used to flow silently through GDPR scrub, ATS scoring and the LLM
+    # plan, producing a confusing near-empty report with no indication that
+    # extraction actually failed. Gate on word count, not character count, so
+    # a genuinely terse one-page CV isn't rejected.
+    if len(cv.raw_text.split()) < MIN_CV_WORD_COUNT:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No extractable text was found in this file. It may be a scanned "
+                "image rather than a text-based document — please upload a "
+                "text-based PDF or DOCX."
+            ),
+        )
+
     # ── GDPR: strip PII before any further processing ─────────────────────────
     try:
         gdpr_ctx = build_gdpr_context(cv.raw_text, scan.file_hash, consent=True)
@@ -1957,7 +1988,7 @@ async def analyse_cv(
     ats = await asyncio.to_thread(score_cv, cv, target_role)
 
     # ── Market match (SBERT) ───────────────────────────────────────────────────
-    match_pct, _ = await asyncio.to_thread(_compute_market_match, ats.skills_found or [target_role], target_role)
+    match_pct, _, match_sample_size = await asyncio.to_thread(_compute_market_match, ats.skills_found or [target_role], target_role)
 
     # ── Phase 2: ML gap analysis (demand × salary × recency priority scoring) ──
     from marketforge.cv.gap_analyser import analyse_gaps
@@ -2003,13 +2034,47 @@ async def analyse_cv(
         ats_issues        = ats.issues,
         skills_found      = ats.skills_found,
         skills_missing    = skills_missing,
-        keyword_match_pct = ats.keyword_match_pct,
-        market_match_pct  = round(match_pct),
+        keyword_match_pct         = ats.keyword_match_pct,
+        keyword_match_numerator   = ats.keyword_match_numerator,
+        keyword_match_denominator = ats.keyword_match_denominator,
+        market_match_pct          = round(match_pct),
+        market_match_sample_size  = match_sample_size,
         gap_plan          = gap_plan,
         narrative_summary = narrative,
         pii_scrubbed      = gdpr_ctx.pii_types_found,
         data_retained     = False,
     )
+
+
+def _default_narrative(ats_score: float, match_pct: float, target_role: str, has_gaps: bool) -> str:
+    if not has_gaps:
+        return (
+            f"Your CV scores {ats_score:.0f}/100 for ATS compatibility with a "
+            f"{match_pct:.0f}% market match for {target_role} roles. There isn't yet "
+            f"enough {target_role} market data to rank specific skill gaps, so this "
+            f"is general ATS feedback only."
+        )
+    return (
+        f"Your CV scores {ats_score:.0f}/100 for ATS compatibility with a "
+        f"{match_pct:.0f}% market match for {target_role} roles. Closing the "
+        f"gaps below is the fastest way to raise both numbers."
+    )
+
+
+def _narrative_names_extra_skill(narrative: str, allowed: set[str]) -> bool:
+    """True if the narrative names a known taxonomy skill outside `allowed`."""
+    import re as _re
+    from marketforge.nlp.taxonomy import SKILL_TAXONOMY
+
+    allowed_lower   = {s.lower() for s in allowed}
+    narrative_lower = narrative.lower()
+    for entry in SKILL_TAXONOMY:
+        canonical = entry["canonical"]
+        if canonical.lower() in allowed_lower:
+            continue
+        if _re.search(rf"\b{_re.escape(canonical.lower())}\b", narrative_lower):
+            return True
+    return False
 
 
 async def _generate_cv_gap_plan(
@@ -2022,125 +2087,74 @@ async def _generate_cv_gap_plan(
     match_pct:     float,
 ) -> tuple[CVGapPlan, str]:
     """
-    LLM call to generate short/mid/long-term plan.
-    Seeded with ML-ranked skill buckets from gap_analyser — receives structured data only,
-    never raw CV text.
+    Build the gap plan. Ranking, bucketing and the plan's structure are
+    entirely deterministic — they come from gap_analyser's ML-ranked buckets,
+    never the model. The model's only job is to narrate the pipeline's own
+    figures in 2 sentences; its output is discarded (in favour of a
+    deterministic narrative) if it names any skill outside what was
+    computed, so it cannot introduce facts the pipeline didn't produce.
     """
+    has_gaps = bool(ml_short_term or ml_mid_term or ml_long_term)
+
+    # One bullet per ML-ranked skill — count and content are fixed by the
+    # deterministic buckets, so horizons can no longer end up with wildly
+    # uneven item counts the way free-form LLM bullets did.
+    short_term = [f"Complete a course or certification in {s}" for s in ml_short_term] \
+        or ["Add measurable outcomes and market-relevant keywords to your experience bullets"]
+    mid_term = [f"Build a portfolio project using {s}" for s in ml_mid_term] \
+        or ["Revisit this analysis once more market data is available for your target role"]
+    long_term = [f"Develop deep expertise in {s}" for s in ml_long_term] \
+        or ["Continue building depth in your current specialisation"]
+
+    narrative = _default_narrative(ats_score, match_pct, target_role, has_gaps)
+
+    if not has_gaps:
+        # Nothing for the model to narrate beyond the score/match figures
+        # already in the default narrative — skip the call rather than
+        # prompt it with empty buckets and let it invent generic advice.
+        return CVGapPlan(short_term=short_term, mid_term=mid_term, long_term=long_term), narrative
+
+    allowed_skills = set(skills_found) | set(ml_short_term) | set(ml_mid_term) | set(ml_long_term)
+
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain_core.messages import HumanMessage
 
-        found_str  = ", ".join(skills_found[:15]) or "none detected"
-        short_str  = ", ".join(ml_short_term) or "none identified"
-        mid_str    = ", ".join(ml_mid_term)   or "none identified"
-        long_str   = ", ".join(ml_long_term)  or "none identified"
+        found_str = ", ".join(skills_found[:15]) or "none detected"
+        gaps_str  = ", ".join(sorted(allowed_skills - set(skills_found))) or "none"
 
-        prompt = f"""You are a UK AI/ML career advisor. Generate a structured career development plan.
+        prompt = f"""You are a UK AI/ML career advisor.
 
-STRUCTURED DATA (use only this — do not invent facts):
+STRUCTURED DATA (the only facts you may use):
 - ATS score: {ats_score:.0f}/100
 - Target role: {target_role}
-- Skills in CV: {found_str}
+- Skills already in the CV: {found_str}
 - Market match: {match_pct:.0f}%
-- ML-ranked quick-win skills to add (0-3 months): {short_str}
-- ML-ranked medium-effort skills (3-12 months): {mid_str}
-- ML-ranked deep-expertise skills (12+ months): {long_str}
+- Priority skill gaps to close: {gaps_str}
 
-Respond in this exact format:
-
-NARRATIVE: [2 sentences: current position assessment based on ATS score and market match]
-
-SHORT_TERM (0-3 months):
-- [specific action for each skill listed above, e.g. courses/certs]
-- [action 2]
-- [action 3]
-
-MID_TERM (3-12 months):
-- [project or bootcamp for each skill listed]
-- [action 2]
-- [action 3]
-
-LONG_TERM (12+ months):
-- [advanced specialisation or portfolio for each skill listed]
-- [action 2]
-
-Keep actions specific and achievable. Do not mention company names."""
+Write exactly 2 sentences assessing the candidate's current position and what
+closing these gaps would achieve. Do not name any skill, tool, framework or
+technology other than those listed above. Do not mention company names.
+Respond with ONLY the 2 sentences — no labels, no preamble."""
 
         llm = ChatGoogleGenerativeAI(
             model=settings.llm.fast_model,
             google_api_key=settings.llm.gemini_api_key,
             temperature=0.2,
         )
-        response = llm.invoke([HumanMessage(content=prompt)])
-        text     = response.content.strip()
+        response      = llm.invoke([HumanMessage(content=prompt)])
+        llm_narrative = response.content.strip()
 
-        # Parse structured sections
-        def _extract_bullets(section_text: str) -> list[str]:
-            return [
-                line.strip().lstrip("-•*123456789. ").strip()
-                for line in section_text.split("\n")
-                if line.strip() and line.strip()[0] in "-•*123456789"
-            ][:3]
-
-        narrative  = ""
-        short_term: list[str] = []
-        mid_term:   list[str] = []
-        long_term:  list[str] = []
-
-        current_section = ""
-        for line in text.split("\n"):
-            if line.startswith("NARRATIVE:"):
-                narrative = line.replace("NARRATIVE:", "").strip()
-                current_section = "narrative"
-            elif "SHORT_TERM" in line:
-                current_section = "short"
-            elif "MID_TERM" in line:
-                current_section = "mid"
-            elif "LONG_TERM" in line:
-                current_section = "long"
-            elif line.strip().startswith("-") or line.strip().startswith("•"):
-                item = line.strip().lstrip("-• ").strip()
-                if item:
-                    if current_section == "short":
-                        short_term.append(item)
-                    elif current_section == "mid":
-                        mid_term.append(item)
-                    elif current_section == "long":
-                        long_term.append(item)
-
-        if not narrative:
-            narrative = (
-                f"Your CV scores {ats_score:.0f}/100 for ATS compatibility with a "
-                f"{match_pct:.0f}% market match for {target_role} roles. "
-                f"Prioritise adding the missing skills to close key gaps."
-            )
-
-        # Fill empty LLM buckets with ML-seed defaults
-        def _seed(llm_items: list[str], ml_skills: list[str], verb: str) -> list[str]:
-            if llm_items:
-                return llm_items
-            return [f"{verb} {s}" for s in ml_skills[:3]] if ml_skills else [f"{verb} top missing skills"]
-
-        return (
-            CVGapPlan(
-                short_term = _seed(short_term, ml_short_term, "Complete a course or certification in"),
-                mid_term   = _seed(mid_term,   ml_mid_term,   "Build a portfolio project using"),
-                long_term  = _seed(long_term,  ml_long_term,  "Develop deep expertise in"),
-            ),
-            narrative,
-        )
+        if llm_narrative and not _narrative_names_extra_skill(llm_narrative, allowed_skills):
+            narrative = llm_narrative
+        else:
+            logger.warning("cv.gap_plan.narrative_rejected", reason="named skill outside computed gap list")
 
     except Exception as exc:
         logger.error("cv.gap_plan.error", error=str(exc))
-        # Graceful degradation: return ML-bucketed skills directly as actionable items
-        short_items = [f"Add {s} to your CV — quick course available" for s in ml_short_term[:3]] or ["Complete a course in top missing skills", "Add metrics to experience bullets", "Mirror job-ad keywords in CV"]
-        mid_items   = [f"Build a project demonstrating {s}" for s in ml_mid_term[:3]]   or ["Build portfolio project using missing skills", "Complete relevant certification"]
-        long_items  = [f"Develop deep expertise in {s}" for s in ml_long_term[:2]]      or ["Target senior roles after closing skill gaps"]
-        return (
-            CVGapPlan(short_term=short_items, mid_term=mid_items, long_term=long_items),
-            f"CV scored {ats_score:.0f}/100 with a {match_pct:.0f}% market match for {target_role} roles. "
-            f"Address the skill gaps above to improve ATS compatibility.",
-        )
+        # narrative already holds the deterministic default — nothing else to do
+
+    return CVGapPlan(short_term=short_term, mid_term=mid_term, long_term=long_term), narrative
 
 
 # ── Prometheus metrics ────────────────────────────────────────────────────────

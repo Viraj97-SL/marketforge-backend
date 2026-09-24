@@ -265,3 +265,12 @@ class TestFullScoreCV:
         assert result.keyword_match_pct == int(result.keyword_match_pct)
         for dim, val in result.breakdown.items():
             assert val == int(val), f"{dim} sub-score {val} is not a whole number"
+
+    def test_keyword_match_denominator_is_zero_without_market_data(self):
+        # Symptom: "Keyword match 53%" shown with no denominator. Without a
+        # configured market DB, the score is a neutral placeholder — the
+        # denominator must say so (0) rather than imply a real comparison.
+        cv     = _cv()
+        result = score_cv(cv, target_role="ml_engineer")
+        assert result.keyword_match_denominator == 0
+        assert result.keyword_match_numerator == 0

@@ -102,21 +102,39 @@ def monkeypatch_module():
 
 # ── File builders ─────────────────────────────────────────────────────────────
 
-def _make_pdf(extra: bytes = b"") -> bytes:
+def _make_pdf(extra: bytes = b"", extra_text: str = "") -> bytes:
+    """
+    A minimal but genuinely valid PDF — with a real content stream, not just
+    loose bytes floating in the file — so pdfplumber/pypdf actually extract
+    the CV text below (needed for the MIN_CV_WORD_COUNT extraction-reliability
+    gate, and for the PII test to see `extra_text` in raw_text at all).
+
+    `extra` is raw bytes appended after the file's own %%EOF — used only by
+    the dangerous-content scanner test, which pattern-matches the whole file
+    byte string and never reaches real parsing.
+    """
+    content = (
+        b"BT /F1 12 Tf 50 720 Td (Senior ML Engineer with 6 years experience in applied ML.) Tj ET\n"
+        b"BT /F1 12 Tf 50 700 Td (Skills: Python PyTorch Docker MLflow scikit-learn SQL Kubernetes) Tj ET\n"
+        b"BT /F1 12 Tf 50 680 Td (Experience) Tj ET\n"
+        b"BT /F1 12 Tf 50 660 Td (Lead ML Engineer at DeepMind 2020-2024) Tj ET\n"
+        b"BT /F1 12 Tf 50 640 Td (Built and deployed production PyTorch models at scale.) Tj ET\n"
+        b"BT /F1 12 Tf 50 620 Td (Education) Tj ET\n"
+        b"BT /F1 12 Tf 50 600 Td (MSc Computer Science, UCL, 2019) Tj ET\n"
+    )
+    if extra_text:
+        content += f"BT /F1 12 Tf 50 580 Td ({extra_text}) Tj ET\n".encode()
+
     body = (
         b"%PDF-1.4\n"
-        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
-        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
-        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
-        b"Senior ML Engineer with Python PyTorch Docker MLflow experience.\n"
-        b"Experience\nLead ML Engineer at DeepMind 2020-2024\n"
-        b"Skills\nPython PyTorch Docker MLflow scikit-learn SQL\n"
-        b"Education\nMSc Computer Science UCL 2019\n"
+        b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+        b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+        b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 5 0 R>>>>/Contents 4 0 R>>endobj\n"
+        + b"4 0 obj<</Length " + str(len(content)).encode() + b">>stream\n" + content + b"endstream\nendobj\n"
+        + b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
+        + b"trailer<</Size 6/Root 1 0 R>>\n%%EOF\n"
     )
-    body += extra
-    body += b"xref\n0 4\n0000000000 65535 f \n"
-    body += b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n9\n%%EOF\n"
-    return body
+    return body + extra
 
 
 def _make_docx(paragraphs: list[str]) -> bytes:
@@ -204,7 +222,8 @@ class TestHappyPath:
         required = {
             "session_token", "ats_score", "ats_grade", "ats_breakdown",
             "ats_issues", "skills_found", "skills_missing",
-            "keyword_match_pct", "market_match_pct",
+            "keyword_match_pct", "keyword_match_numerator", "keyword_match_denominator",
+            "market_match_pct", "market_match_sample_size",
             "gap_plan", "narrative_summary", "pii_scrubbed", "data_retained",
         }
         for field in required:
@@ -265,6 +284,23 @@ class TestHappyPath:
         for dim, val in data["ats_breakdown"].items():
             assert isinstance(val, int), f"{dim} breakdown value {val!r} is not an int"
 
+    def test_percentages_carry_a_denominator(self, client):
+        # Symptom: "Market match 34%" / "Keyword match 53%" shown with no
+        # denominator and no stated difference between the two metrics.
+        pdf  = _make_pdf()
+        data = client.post(
+            "/api/v1/career/cv-analyse",
+            files={"cv_file": ("cv.pdf", pdf, "application/pdf")},
+            params={"target_role": "ml_engineer", "consent": "true"},
+        ).json()
+        assert isinstance(data["keyword_match_denominator"], int)
+        assert isinstance(data["keyword_match_numerator"], int)
+        assert isinstance(data["market_match_sample_size"], int)
+        # No configured market DB in this test client — both denominators
+        # must say so (0) rather than silently implying a real comparison.
+        assert data["keyword_match_denominator"] == 0
+        assert data["market_match_sample_size"] == 0
+
     def test_gap_plan_has_all_horizons(self, client):
         pdf  = _make_pdf()
         data = client.post(
@@ -288,7 +324,7 @@ class TestHappyPath:
 
     def test_pii_in_cv_scrubbed_and_reported(self, client):
         """CV containing an email should have 'email' in pii_scrubbed."""
-        pdf_with_pii = _make_pdf(extra=b"\nContact: john.doe@example.com\n")
+        pdf_with_pii = _make_pdf(extra_text="Contact: john.doe@example.com")
         data = client.post(
             "/api/v1/career/cv-analyse",
             files={"cv_file": ("cv.pdf", pdf_with_pii, "application/pdf")},
@@ -363,6 +399,42 @@ class TestSecurityRejections:
             params={"target_role": "ml_engineer", "consent": "true"},
         )
         assert resp.status_code == 422
+
+
+class TestExtractionReliability:
+    def _make_image_only_pdf(self) -> bytes:
+        """A structurally valid PDF (a real page, no scanner-triggering
+        content) with an empty content stream — simulates a scanned/image-only
+        CV where extraction "succeeds" but yields no text at all."""
+        return (
+            b"%PDF-1.4\n"
+            b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+            b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R>>endobj\n"
+            b"4 0 obj<</Length 0>>stream\n\nendstream\nendobj\n"
+            b"trailer<</Size 5/Root 1 0 R>>\n%%EOF\n"
+        )
+
+    def test_scanned_image_pdf_rejected_with_specific_reason(self, client):
+        pdf  = self._make_image_only_pdf()
+        resp = client.post(
+            "/api/v1/career/cv-analyse",
+            files={"cv_file": ("scanned.pdf", pdf, "application/pdf")},
+            params={"target_role": "ml_engineer", "consent": "true"},
+        )
+        assert resp.status_code == 422
+        assert "scanned image" in resp.json()["detail"].lower()
+
+    def test_normal_cv_with_sparse_but_real_text_is_not_rejected(self, client):
+        # The gate is on word count, not the mere presence of any error, so a
+        # genuinely short (but real) CV must still go through.
+        pdf  = _make_pdf()
+        resp = client.post(
+            "/api/v1/career/cv-analyse",
+            files={"cv_file": ("cv.pdf", pdf, "application/pdf")},
+            params={"target_role": "ml_engineer", "consent": "true"},
+        )
+        assert resp.status_code == 200
 
     def test_empty_file_rejected_422(self, client):
         resp = client.post(
