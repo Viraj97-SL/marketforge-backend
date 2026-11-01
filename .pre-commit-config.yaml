@@ -1,0 +1,13 @@
+# Secret scanning on every commit. Setup once per clone:
+#   pip install pre-commit && pre-commit install
+# Scan full history on demand:
+#   pre-commit run gitleaks --all-files
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: detect-private-key

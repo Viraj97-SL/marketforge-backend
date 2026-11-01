@@ -11,7 +11,7 @@ Usage:
 from __future__ import annotations
 
 import time
-from typing import Callable
+from typing import Callable, Mapping
 
 import structlog
 from fastapi import Request, Response, HTTPException
@@ -19,6 +19,44 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = structlog.get_logger(__name__)
+
+# ── Production configuration guards ──────────────────────────────────────────
+
+# Env vars the API process cannot safely run without in production.
+REQUIRED_PRODUCTION_ENV: tuple[str, ...] = (
+    "DATABASE_URL",
+    "REDIS_URL",
+    "GEMINI_API_KEY",
+    "ALLOWED_ORIGINS",
+)
+
+
+def resolve_allowed_origins(raw: str, is_production: bool) -> list[str]:
+    """
+    Parse the comma-separated ALLOWED_ORIGINS value.
+
+    Production must name explicit origins — an unset value or "*" raises so a
+    misconfigured deploy fails its healthcheck instead of serving open CORS.
+    Development falls back to "*" for local convenience.
+    """
+    # Browsers send Origin without a trailing slash — normalise so "https://x.com/" still matches
+    origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip().rstrip("/")]
+    if not is_production:
+        return origins or ["*"]
+    if not origins:
+        raise RuntimeError("ALLOWED_ORIGINS must be set in production (comma-separated origins)")
+    if "*" in origins:
+        raise RuntimeError("ALLOWED_ORIGINS must not contain a wildcard in production")
+    insecure = [o for o in origins if not o.startswith("https://")]
+    if insecure:
+        raise RuntimeError(f"ALLOWED_ORIGINS must use https:// in production: {insecure}")
+    return origins
+
+
+def missing_production_secrets(env: Mapping[str, str]) -> list[str]:
+    """Return the required production env vars that are unset or blank, in declared order."""
+    return [name for name in REQUIRED_PRODUCTION_ENV if not env.get(name, "").strip()]
+
 
 # ── Rate limiting state (backed by Redis when available) ─────────────────────
 

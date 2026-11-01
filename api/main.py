@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
@@ -38,7 +39,7 @@ from marketforge.config.settings import settings
 from marketforge.memory.postgres import init_database
 from marketforge.memory.redis_cache import DashboardCache, RateLimiter
 from marketforge.utils.logger import setup_logging
-from api.security import SecurityMiddleware
+from api.security import SecurityMiddleware, missing_production_secrets, resolve_allowed_origins
 
 logger  = structlog.get_logger(__name__)
 cache   = DashboardCache()
@@ -60,6 +61,12 @@ def _get_sbert():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
+    if settings.is_production:
+        missing = missing_production_secrets(os.environ)
+        if missing:
+            # Names only — never log secret values
+            logger.error("api.startup.missing_secrets", missing=missing)
+            raise RuntimeError(f"Missing required production env vars: {', '.join(missing)}")
     init_database()
     # Pre-warm SBERT so both gunicorn workers have the model loaded before
     # handling requests — prevents 30s+ cold-start on the first CV analysis.
@@ -84,7 +91,9 @@ app = FastAPI(
     redoc_url=None,
 )
 
-_ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["*"]
+_ALLOWED_ORIGINS = resolve_allowed_origins(os.getenv("ALLOWED_ORIGINS", ""), settings.is_production)
+# Optional, e.g. ^https://marketforge-frontend-[a-z0-9-]+\.vercel\.app$ for Vercel previews
+_ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX") or None
 
 # CORSMiddleware must be registered BEFORE SecurityMiddleware so it becomes the
 # inner layer in the ASGI stack. FastAPI applies middleware LIFO, so the last
@@ -97,6 +106,7 @@ _ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
+    allow_origin_regex=_ALLOWED_ORIGIN_REGEX,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Authorization"],
     allow_credentials=False,
@@ -116,24 +126,49 @@ def _get_client_ip(request: Request) -> str:
 
 
 # ── Rate limit middleware ─────────────────────────────────────────────────────
+# Registered via @app.middleware AFTER CORSMiddleware, so this is the OUTERMOST
+# layer: its own responses never pass through CORSMiddleware and must carry
+# CORS headers themselves, or browsers report a CORS error instead of the 429.
+
+def _cors_headers_for(request: Request) -> dict[str, str]:
+    """Mirror CORSMiddleware's allow-list decision for responses produced outside it."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    if "*" in _ALLOWED_ORIGINS:
+        return {"Access-Control-Allow-Origin": "*"}
+    if origin in _ALLOWED_ORIGINS or (
+        _ALLOWED_ORIGIN_REGEX and re.fullmatch(_ALLOWED_ORIGIN_REGEX, origin)
+    ):
+        return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+    return {}
+
+
+def _rate_limited(request: Request) -> PlainTextResponse:
+    return PlainTextResponse("Rate limit exceeded", status_code=429, headers=_cors_headers_for(request))
+
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     ip  = _get_client_ip(request)
     path = request.url.path
 
-    # CV analyse has its own per-endpoint limiter (3/hour) — skip middleware check
-    if path == "/api/v1/career/cv-analyse":
+    # CORS preflights are answered by CORSMiddleware without reaching a handler —
+    # don't spend rate-limit budget on them or block them when Redis is down
+    if request.method == "OPTIONS" and "access-control-request-method" in request.headers:
         pass
-    # Career advisor: 10 req/min (LLM-backed, expensive)
+    # CV analyse has its own per-endpoint limiter (3/hour) — skip middleware check
+    elif path == "/api/v1/career/cv-analyse":
+        pass
+    # Career advisor: 10 req/min (LLM-backed, expensive — fail closed without Redis)
     elif path.startswith("/api/v1/career"):
-        if not limiter.is_allowed(f"career:{ip}", limit=10, window_seconds=60):
-            return PlainTextResponse("Rate limit exceeded", status_code=429)
+        if not limiter.is_allowed(f"career:{ip}", limit=10, window_seconds=60, fail_closed=True):
+            return _rate_limited(request)
 
     # Market data: 100 req/min (Redis-cached, cheap)
     elif path.startswith("/api/v1/market"):
         if not limiter.is_allowed(f"market:{ip}", limit=100, window_seconds=60):
-            return PlainTextResponse("Rate limit exceeded", status_code=429)
+            return _rate_limited(request)
 
     return await call_next(request)
 
@@ -190,7 +225,6 @@ class HealthResponse(BaseModel):
     description="Analyses your profile against current market data. No data is persisted.",
 )
 async def analyse_career(profile: UserProfile, request: Request, fastapi_response: Response) -> CareerIntelligenceReport:
-    fastapi_response.headers["Access-Control-Allow-Origin"] = "*"
     ip = _get_client_ip(request)
 
     # ── Security gate ─────────────────────────────────────────────────────────
@@ -1887,19 +1921,6 @@ class CVAnalysisReport(BaseModel):
     data_retained:     bool = False     # always False — GDPR guarantee
 
 
-@app.options("/api/v1/career/cv-analyse")
-@app.options("/api/v1/career/analyse")
-async def career_cors_preflight():
-    return Response(
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            "Access-Control-Max-Age": "3600",
-        }
-    )
-
-
 @app.post(
     "/api/v1/career/cv-analyse",
     response_model=CVAnalysisReport,
@@ -1925,7 +1946,7 @@ async def analyse_cv(
     ip = _get_client_ip(request)
 
     # ── Rate limit: 3 CV analyses per IP per hour (expensive operation) ────────
-    if not limiter.is_allowed(f"cv_analyse:{ip}", limit=3, window_seconds=3600):
+    if not limiter.is_allowed(f"cv_analyse:{ip}", limit=3, window_seconds=3600, fail_closed=True):
         raise HTTPException(status_code=429, detail="CV analysis rate limit exceeded (3/hour)")
 
     # ── Validate target_role against injection ────────────────────────────────
@@ -2021,10 +2042,6 @@ async def analyse_cv(
         ats_grade=ats.grade,
         ml_gaps_total=len(ml_gaps.all_gaps),
     )
-
-    fastapi_response.headers["Access-Control-Allow-Origin"] = "*"
-    fastapi_response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-    fastapi_response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
 
     return CVAnalysisReport(
         session_token     = gdpr_ctx.session_token,

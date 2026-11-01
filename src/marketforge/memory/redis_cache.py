@@ -180,11 +180,17 @@ class RateLimiter:
     Per-IP / per-source rate limiter using Redis sliding window.
     Falls back to a simple in-process dict if Redis is unavailable
     (not distributed, but prevents abuse in single-process deployments).
+
+    fail_closed=True denies requests in production when Redis is unavailable —
+    use it for expensive (LLM / CV) endpoints, where the per-process fallback
+    would multiply the effective limit by the number of gunicorn workers.
     """
 
     _fallback: dict[str, list[float]] = {}
 
-    def is_allowed(self, key: str, limit: int, window_seconds: int) -> bool:
+    def is_allowed(
+        self, key: str, limit: int, window_seconds: int, fail_closed: bool = False
+    ) -> bool:
         r = get_redis()
         if r:
             try:
@@ -197,8 +203,11 @@ class RateLimiter:
                 pipe.expire(window_key, window_seconds)
                 _, count, *_ = pipe.execute()
                 return int(count) < limit
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("ratelimit.redis_error", key=key, error=str(exc))
+        if fail_closed and settings.is_production:
+            logger.warning("ratelimit.fail_closed", key=key)
+            return False
         # Fallback: in-process sliding window
         now = time.time()
         timestamps = [t for t in self._fallback.get(key, []) if now - t < window_seconds]
